@@ -34,7 +34,10 @@ enum class Stage : std::uint32_t { Main, Fragment, TessellationControl, Tessella
 inline constexpr std::uint32_t UserDataCapacity = 128u;
 inline constexpr std::uint32_t BufferCapacity = 128u;
 inline constexpr std::uint32_t ImageCapacity = 256u;
-inline constexpr std::uint32_t SampledHeapCapacity = 16u;
+// A sampled image group holds each image of the shader at most once, so it never needs more
+// than ImageCapacity descriptors; heaps are declared at the shader's own count, not at this size.
+inline constexpr std::uint32_t SampledHeapCapacity = ImageCapacity;
+inline constexpr std::uint32_t BindlessTableSlots = 16u;
 inline constexpr std::uint32_t StorageHeapCapacity = 4u;
 inline constexpr std::uint32_t SamplerHeapCapacity = 16u;
 

@@ -300,7 +300,16 @@ public:
     bool ZeroBit(const IrValue* bit) {
         bit = Resolved(bit);
         if (bit == nullptr || !Spend()) return false;
-        if (Is(bit, IrOpcode::LogicalAnd)) return ZeroBit(bit->Argument(0)) || ZeroBit(bit->Argument(1));
+        if (bit->HasImmediate()) return bit->Type() == IrType::Bool && !bit->ImmediateBool();
+        switch (bit->Opcode()) {
+            case IrOpcode::LogicalAnd: return ZeroBit(bit->Argument(0)) || ZeroBit(bit->Argument(1));
+            // The lane bit of a ballot that SSA folded back into its predicate, such as a live-lane
+            // mask carried through the structured control flow of a pixel program that discards.
+            case IrOpcode::IEqual32: return NotHelper(bit);
+            case IrOpcode::SelectU1: return ZeroBit(bit->Argument(1)) && ZeroBit(bit->Argument(2));
+            case IrOpcode::Phi: return Incoming(bit, [this](const IrValue* incoming) { return ZeroBit(incoming); });
+            default: break;
+        }
         const auto words = LaneBitWords(bit);
         return words && Word((*words)[0], 0u) && Word((*words)[1], 1u);
     }

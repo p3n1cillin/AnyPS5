@@ -216,6 +216,28 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
     throw std::runtime_error("AGC driver: prepared rectangle artifacts are missing");
 }
 
+ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, const ShaderRecompiler::CompiledShaderArtifact& vertex, const ShaderRecompiler::CompiledShaderArtifact& fragment, const ShaderRecompiler::SpirvTarget& target) {
+    {
+        std::lock_guard lock(snapshot.prepared->mutex);
+        for (const auto& entry : snapshot.prepared->rectangles) {
+            if (entry.vertexId == vertex.variantId && entry.fragmentId == fragment.variantId) {
+                require(entry.shaders != nullptr, "prepared rectangle artifact is missing");
+                return *entry.shaders;
+            }
+        }
+    }
+    // A stage prepared at its first draw (a deferred shader, the null pixel program) was not paired
+    // when the ABI was resolved: pair the artifacts the draw holds, the way ResolvePreparedGraphics does.
+    ShaderRecompiler::RecompileResult vertexResult;
+    ShaderRecompiler::RecompileResult fragmentResult;
+    static_cast<ShaderRecompiler::CompiledShaderArtifact&>(vertexResult) = vertex;
+    static_cast<ShaderRecompiler::CompiledShaderArtifact&>(fragmentResult) = fragment;
+    auto shaders = std::make_shared<const ShaderRecompiler::RectListShaders>(ShaderRecompiler::BuildRectListShaders(vertexResult, fragmentResult, target));
+    std::lock_guard lock(snapshot.prepared->mutex);
+    snapshot.prepared->rectangles.push_back({vertex.variantId, fragment.variantId, shaders});
+    return *shaders;
+}
+
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
@@ -773,6 +795,9 @@ void Driver::RegisterShader(const Shader* shader) {
         nullState.context = null.registeredState->context;
         nullState.userConfig = null.registeredState->userConfig;
         null.prepared->entries = PrepareRegistered(null, *localDevice, nullState, true);
+        // Draws substitute this program under whatever pixel state they carry, which registration
+        // cannot enumerate: prepare the variants they need when they are first used.
+        null.prepared->deferred = true;
         PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(std::move(null)));
     }
     transaction.Commit();

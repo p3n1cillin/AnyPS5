@@ -922,7 +922,17 @@ auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltyp
         return impl();
     } catch (const std::exception& e) {
         constexpr auto requestSerializer = RequestSerializer{};
-        const auto inputInfo = "\nRecompileRequest:\n" + requestSerializer.Serialize(request);
+        const auto serialized = requestSerializer.Serialize(request);
+        // Debug aid: APS5_DUMP_FAILED_REQUESTS writes failed_<code address>.req for agc_shader_replay.
+        if (std::getenv("APS5_DUMP_FAILED_REQUESTS") != nullptr) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "failed_%llx.req", static_cast<unsigned long long>(request.shader.codeAddress));
+            if (std::FILE* file = std::fopen(name, "wb")) {
+                std::fwrite(serialized.data(), 1, serialized.size(), file);
+                std::fclose(file);
+            }
+        }
+        const auto inputInfo = "\nRecompileRequest:\n" + serialized;
         throw std::runtime_error(std::string("ShaderRecompiler::Recompile: ") + e.what() + inputInfo);
     } catch (...) {
         throw std::runtime_error("ShaderRecompiler::Recompile: unknown exception");
