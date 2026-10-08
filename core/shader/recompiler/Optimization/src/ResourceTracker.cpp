@@ -562,6 +562,7 @@ private:
         value = value->Resolve();
         std::vector<IrValue*> phis;
         CollectDescriptorPhis(value, phis, depth);
+        std::erase_if(phis, [this](const IrValue* phi) { return phi->Parent() != m_splitBlock; });
         if (phis.empty()) {
             return value;
         }
@@ -596,27 +597,28 @@ private:
         return phi;
     }
 
-    void SplitDescriptorPhi(IrValue& inst) {
+    std::vector<IrValue*> SplitDescriptorPhi(IrValue& inst) {
         const auto info = ImageOpcodeInfoOf(inst.Opcode());
         const std::uint32_t handleCount = info.needsSampler ? 2u : 1u;
         if (inst.ArgumentCount() < handleCount) {
-            return;
+            return {};
         }
         std::array<IrValue*, 2> handles {};
         std::array<bool, 2> split {};
+        std::array<std::vector<IrValue*>, 2> slotPhis;
         std::vector<IrValue*> phis;
         for (std::uint32_t slot = 0; slot < handleCount; slot++) {
             IrValue* handle = inst.Argument(slot)->Resolve();
             const auto expected = slot == 0u ? IrOpcode::GetImageResource : IrOpcode::GetSamplerResource;
             if (handle->Opcode() != expected || handle->ArgumentCount() != (slot == 0u ? 8u : 4u)) {
-                return;
+                return {};
             }
             handles[slot] = handle;
             std::vector<IrValue*> handlePhis;
             for (std::size_t dword = 0; dword < handle->ArgumentCount(); dword++) {
                 CollectDescriptorPhis(handle->Argument(dword), handlePhis, phiSearchDepth);
             }
-            split[slot] = !handlePhis.empty();
+            slotPhis[slot] = handlePhis;
             for (IrValue* phi : handlePhis) {
                 if (std::ranges::find(phis, phi) == phis.end()) {
                     phis.push_back(phi);
@@ -624,23 +626,30 @@ private:
             }
         }
         if (phis.empty()) {
-            return;
+            return {};
         }
+        // The image and sampler can each be selected in a different block: split on one block's
+        // Phis here, and the copies, which still carry the other block's Phis, in a later pass.
         IrBlock* block = phis.front()->Parent();
         if (block == nullptr || inst.Parent() == nullptr) {
-            return;
+            return {};
         }
+        std::erase_if(phis, [block](const IrValue* phi) { return phi->Parent() != block; });
+        for (std::uint32_t slot = 0; slot < handleCount; slot++) {
+            split[slot] = std::ranges::any_of(slotPhis[slot], [block](const IrValue* phi) { return phi->Parent() == block; });
+        }
+        m_splitBlock = block;
         const auto& predecessors = block->Predecessors();
         if (predecessors.size() < 2u) {
-            return;
+            return {};
         }
         for (const IrValue* phi : phis) {
             if (phi->Parent() != block || phi->PhiBlockCount() != predecessors.size()) {
-                return;
+                return {};
             }
             for (const IrBlock* predecessor : predecessors) {
                 if (PhiIncoming(*phi, predecessor) == nullptr) {
-                    return;
+                    return {};
                 }
             }
         }
@@ -666,7 +675,7 @@ private:
             for (std::uint32_t slot = 0; slot < handleCount; slot++) {
                 for (std::size_t dword = 0; split[slot] && dword < handles[slot]->ArgumentCount(); dword++) {
                     if (SubstituteEdge(handles[slot]->Argument(dword), arm, inst, false, phiSearchDepth) == nullptr) {
-                        return;
+                        return {};
                     }
                 }
             }
@@ -721,6 +730,7 @@ private:
         inst.ReplaceAllUsesWith(result);
         inst.Invalidate();
         inst.Parent()->RemoveInstruction(&inst);
+        return copies;
     }
 
     void SplitDescriptorPhis() {
@@ -732,8 +742,11 @@ private:
                 }
             }
         }
-        for (IrValue* inst : candidates) {
-            SplitDescriptorPhi(*inst);
+        while (!candidates.empty()) {
+            IrValue* inst = candidates.back();
+            candidates.pop_back();
+            const auto copies = SplitDescriptorPhi(*inst);
+            candidates.insert(candidates.end(), copies.begin(), copies.end());
         }
     }
 
@@ -1108,6 +1121,7 @@ private:
         IrValue* value = nullptr;
     };
     std::vector<EdgeSelectorEntry> m_edgeSelectors;
+    const IrBlock* m_splitBlock = nullptr;
 };
 
 }

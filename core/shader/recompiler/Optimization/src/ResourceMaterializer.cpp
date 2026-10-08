@@ -615,6 +615,16 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             volume.dimension = RdnaImageDimension::Dim3D;
             modes.push_back(volume);
         }
+        // The descriptor's type decides the image's shape: an image with fewer dimensions than the
+        // address uses the leading coordinates and ignores the rest.
+        if ((image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim3D) && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
+            for (const auto lower : {RdnaImageDimension::Dim1D, RdnaImageDimension::Dim2D}) {
+                if (lower == image.dimension) break;
+                auto narrower = mode;
+                narrower.dimension = lower;
+                modes.push_back(narrower);
+            }
+        }
         if (image.dimension == RdnaImageDimension::Dim1DArray || image.dimension == RdnaImageDimension::Dim2DArray || image.dimension == RdnaImageDimension::Dim2DMsaaArray) {
             auto plain = mode;
             plain.dimension = image.dimension == RdnaImageDimension::Dim1DArray ? RdnaImageDimension::Dim1D : image.dimension == RdnaImageDimension::Dim2DArray ? RdnaImageDimension::Dim2D : RdnaImageDimension::Dim2DMsaa;
@@ -724,7 +734,14 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         if (mode.numericClass == decoded.numericClass && mode.dimension == decoded.dimension && mode.conversionFormat == decoded.conversionFormat && mode.packedFormat == decoded.packedFormat && mode.cube == decoded.cube && mode.depthBits == decoded.depthBits && mode.depthUnorm16 == decoded.depthUnorm16 && mode.srgbDecode == decoded.srgbDecode) return index;
     }
     if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) throw std::runtime_error("image address has too few coordinate components");
-    throw std::runtime_error("image descriptor is incompatible with the static runtime image interface");
+    const auto describe = [](const auto& value) {
+        return "numeric=" + std::to_string(static_cast<int>(value.numericClass)) + " dim=" + std::to_string(static_cast<int>(value.dimension)) + " conversion=" + std::to_string(static_cast<int>(value.conversionFormat)) +
+            " packed=" + std::to_string(static_cast<int>(value.packedFormat)) + " cube=" + std::to_string(value.cube) + " depthBits=" + std::to_string(value.depthBits) + " unorm16=" + std::to_string(value.depthUnorm16) +
+            " srgb=" + std::to_string(value.srgbDecode) + "";
+    };
+    std::string detail = "descriptor {" + describe(decoded) + " emulated=" + std::to_string(emulated) + " fmask=" + std::to_string(decoded.fmask) + "} modes";
+    for (const auto& mode : modes) detail += " {" + describe(mode) + "}";
+    throw std::runtime_error("image descriptor is incompatible with the static runtime image interface: " + detail);
 }
 
 std::uint32_t ResourceMaterializer::EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index) {
