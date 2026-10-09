@@ -185,6 +185,7 @@ private:
     static std::string describeSelf(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t begin, std::uint64_t end);
     static bool traceBudget();
     void traceCapture(const char* what, std::uint64_t program, std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions, double waitedMs);
+    void traceCaptureStability(const char* phase, std::uint64_t program, std::span<const ShaderRecompiler::MemoryRegion> regions);
     void reportValidation(ValidateCounters& counters);
     bool captureStable(std::span<const ShaderRecompiler::MemoryRegion> captured);
     bool validateCaptured(std::uint64_t program, std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderRecompiler::RecompileResult& compiled, bool inPlace, const PendingView& view, bool* unmapped = nullptr, std::optional<SampledReadScope>* sampling = nullptr, const DataMask* data = nullptr);

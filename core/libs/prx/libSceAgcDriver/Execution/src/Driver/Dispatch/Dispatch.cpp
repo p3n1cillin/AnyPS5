@@ -203,6 +203,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 return shaderMemory->Capture(invocation);
             }();
             captured = shaderMemory->Regions();
+            traceCaptureStability("captured", address, captured);
             request.context.memory = captured;
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
             captureMs += phaseTiming.Elapsed();
@@ -213,6 +214,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
+            traceCaptureStability("materialized", address, captured);
             timing.Mark("materialize");
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -235,10 +237,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
+    traceCaptureStability("before_labels", address, captured);
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);
         return;
     }
+    traceCaptureStability("after_labels", address, captured);
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
@@ -314,6 +318,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseLockWait);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
+        traceCaptureStability("before_record", address, captured);
         phaseTiming.Phase(PhaseLabels);
         if (noteWrites && writerKeyedEvidence() && !writersNoted) {
             noteWrittenBuffers(address, submission.queue, compiled);
