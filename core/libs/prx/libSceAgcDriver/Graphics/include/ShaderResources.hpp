@@ -151,6 +151,15 @@ public:
         std::size_t storageElement;
     };
     std::vector<AtomicImage> AtomicImages() const;
+    struct GuestBufferView {
+        std::uint32_t binding;
+        std::uint32_t element;
+        std::uint64_t address;
+        std::size_t bytes;
+        std::uint32_t adjustment;
+        VkDescriptorBufferInfo descriptor;
+    };
+    std::vector<GuestBufferView> BoundGuestBuffers() const;
     // Whether a use writes guest memory beyond a draw's attachments (storage images, written or
     // copied buffers, an address-based build's unknown writes), or reads `image` (a view of it
     // sampled, or the image itself bound): a recorded draw's render pass may only be continued by
@@ -263,6 +272,7 @@ private:
         std::int32_t pushByte = -1;
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
+        VkDescriptorBufferInfo gpuView{};
     };
     struct DataPatch {
         std::size_t allocation;

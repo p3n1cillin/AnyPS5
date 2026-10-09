@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/GpuAtomicCapture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -37,6 +39,61 @@ struct ImageCopy {
     std::size_t bytes;
     std::shared_ptr<Graphics::Buffer> buffer;
 };
+
+struct BufferCopy {
+    Graphics::ShaderResources::GuestBufferView source;
+    std::shared_ptr<Graphics::Buffer> buffer;
+};
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> ParseBuffers(std::string_view value) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> result;
+    while (!value.empty()) {
+        const auto comma = value.find(',');
+        const auto entry = value.substr(0, comma);
+        const auto colon = entry.find(':');
+        if (colon == std::string_view::npos) throw std::runtime_error("GPU buffer capture requires binding:element pairs");
+        const auto binding = Parse(std::string(entry.substr(0, colon)).c_str(), 10);
+        const auto element = Parse(std::string(entry.substr(colon + 1)).c_str(), 10);
+        if (binding > std::numeric_limits<std::uint32_t>::max() || element > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("GPU buffer capture index exceeds uint32");
+        const std::pair selected{static_cast<std::uint32_t>(binding), static_cast<std::uint32_t>(element)};
+        if (result.size() == 32 || std::find(result.begin(), result.end(), selected) != result.end()) throw std::runtime_error("GPU buffer capture selection is too long or duplicated");
+        result.push_back(selected);
+        if (comma == std::string_view::npos) break;
+        value.remove_prefix(comma + 1);
+        if (value.empty()) throw std::runtime_error("GPU buffer capture selection ends with a comma");
+    }
+    if (result.empty()) throw std::runtime_error("GPU buffer capture selection is empty");
+    return result;
+}
+
+void RecordCopy(const Graphics::Context& context, Graphics::Recorder& recorder, BufferCopy& copy) {
+    copy.buffer = std::make_shared<Graphics::Buffer>(context, copy.source.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    recorder.Keep(copy.buffer, copy.source.bytes);
+    const auto commands = recorder.Commands();
+    VkBufferMemoryBarrier source{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    source.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    source.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    source.buffer = copy.source.descriptor.buffer;
+    source.offset = copy.source.descriptor.offset + copy.source.adjustment;
+    source.size = copy.source.bytes;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &source, 0, nullptr);
+    const VkBufferCopy region{source.offset, 0, source.size};
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, source.buffer, copy.buffer->Handle(), 1, &region);
+    source.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    source.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host.buffer = copy.buffer->Handle();
+    host.size = VK_WHOLE_SIZE;
+    const std::array barriers{source, host};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, barriers.size(), barriers.data(), 0, nullptr);
+    recorder.MarkCovered(0);
+}
 
 std::uint32_t AtomicTexelBytes(VkFormat format) {
     switch (format) {
@@ -99,6 +156,7 @@ GpuAtomicCaptureOptions GpuAtomicCapture::ReadOptions() {
             result.limit = static_cast<std::uint32_t>(value);
         }
         if (const auto* directory = std::getenv("APS5_DUMP_ATOMIC_INPUT_DIR")) result.directory = directory;
+        if (const auto* buffers = std::getenv("APS5_DUMP_ATOMIC_INPUT_BUFFERS")) result.buffers = ParseBuffers(buffers);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu-atomic-input] disabled: %s\n", error.what());
         result.program = 0;
@@ -114,7 +172,7 @@ std::uint32_t GpuAtomicCapture::Write(const Graphics::Context& context, Graphics
     std::lock_guard lock(mutex);
     if (stopped || count >= options.limit) return 0;
     const auto images = resources.AtomicImages();
-    if (images.empty()) return 0;
+    if (images.empty() && options.buffers.empty()) return 0;
     const auto remaining = options.byteBudget - bytes;
     std::uint64_t total = shader.spirv.size() * sizeof(std::uint32_t) + pushConstants.size();
     std::vector<ImageCopy> copies;
@@ -136,12 +194,29 @@ std::uint32_t GpuAtomicCapture::Write(const Graphics::Context& context, Graphics
         copy.region.imageExtent = {mip.width, mip.height, depth};
         copies.push_back(std::move(copy));
     }
+    std::vector<BufferCopy> buffers;
+    if (!options.buffers.empty()) {
+        const auto views = resources.BoundGuestBuffers();
+        for (const auto& selected : options.buffers) {
+            const auto found = std::find_if(views.begin(), views.end(), [&](const auto& view) { return view.binding == selected.first && view.element == selected.second; });
+            if (found == views.end() || found->descriptor.buffer == VK_NULL_HANDLE || found->bytes == 0 || found->bytes > 16u * 1024u * 1024u || total > remaining || found->bytes > remaining - total) {
+                stopped = true;
+                std::fprintf(stderr, "[gpu-atomic-input] stopped: selected guest buffer absent, invalid or over budget\n");
+                return 0;
+            }
+            if (found->adjustment > found->descriptor.range || found->bytes > found->descriptor.range - found->adjustment) throw std::runtime_error("GPU capture buffer exceeds its bound descriptor");
+            total += found->bytes;
+            buffers.push_back({*found, {}});
+        }
+    }
     std::ostringstream out;
     out << "{\n\"schema_version\":1,\"sequence\":" << count + 1u << ",\"program\":\"0x" << std::hex << program << std::dec;
     out << "\",\"variant_id\":\"0x" << std::hex << shader.variantId << "\",\"pipeline_variant_id\":\"0x" << shader.PipelineVariantId() << std::dec;
     out << "\",\"groups\":[" << groups[0] << ',' << groups[1] << ',' << groups[2] << "]";
     out << ",\"groups_resolved\":" << (arguments == 0 ? "true" : "false") << ",\"indirect_arguments\":\"0x" << std::hex << arguments << std::dec;
-    out << "\",\"stage\":\"prepared_pre_dispatch\",\"synchronized\":true,\"gpu_atomic_image_contents\":true,\"captures_guest_buffers\":false,\"layout\":\"packed_texels_layer_then_z_then_y_then_x\",\"images\":[";
+    out << "\",\"stage\":\"prepared_pre_dispatch\",\"synchronized\":true,\"gpu_atomic_image_contents\":" << (copies.empty() ? "false" : "true");
+    out << ",\"captures_guest_buffers\":" << (buffers.empty() ? "false" : "true");
+    out << ",\"captures_all_guest_buffers\":false,\"host_writes_frozen\":false,\"layout\":\"packed_texels_layer_then_z_then_y_then_x\",\"images\":[";
     for (std::size_t index = 0; index < copies.size(); ++index) {
         if (index != 0) out << ',';
         const auto& copy = copies[index];
@@ -151,6 +226,13 @@ std::uint32_t GpuAtomicCapture::Write(const Graphics::Context& context, Graphics
         out << ",\"storage_format\":" << static_cast<unsigned int>(copy.image.texture->StorageFormat()) << ",\"mip\":" << copy.image.mip;
         out << ",\"base_layer\":" << descriptor.baseArray << ",\"layers\":" << copy.region.imageSubresource.layerCount;
         out << ",\"extent\":[" << copy.region.imageExtent.width << ',' << copy.region.imageExtent.height << ',' << copy.region.imageExtent.depth << "],\"bytes\":" << copy.bytes << '}';
+    }
+    out << "],\"buffers\":[";
+    for (std::size_t index = 0; index < buffers.size(); ++index) {
+        if (index != 0) out << ',';
+        const auto& source = buffers[index].source;
+        out << "{\"file\":\"buffer_" << source.binding << '_' << source.element << ".bin\",\"binding\":" << source.binding << ",\"element\":" << source.element;
+        out << ",\"guest_address\":\"0x" << std::hex << source.address << std::dec << "\",\"bytes\":" << source.bytes << ",\"descriptor_adjustment\":" << source.adjustment << '}';
     }
     out << "]\n}\n";
     const auto metadata = out.str();
@@ -175,19 +257,25 @@ std::uint32_t GpuAtomicCapture::Write(const Graphics::Context& context, Graphics
         return 0;
     }
     for (auto& copy : copies) RecordCopy(context, recorder, copy);
+    for (auto& copy : buffers) RecordCopy(context, recorder, copy);
     recorder.Sync();
     for (auto& copy : copies) copy.buffer->Invalidate();
+    for (auto& copy : buffers) copy.buffer->Invalidate();
     try {
         for (std::size_t index = 0; index < copies.size(); ++index) {
             const auto data = copies[index].buffer->Bytes();
             WriteFile(directory / ("image_" + std::to_string(index) + ".bin"), reinterpret_cast<const char*>(data.data()), data.size());
+        }
+        for (const auto& copy : buffers) {
+            const auto data = copy.buffer->Bytes();
+            WriteFile(directory / ("buffer_" + std::to_string(copy.source.binding) + "_" + std::to_string(copy.source.element) + ".bin"), reinterpret_cast<const char*>(data.data()), data.size());
         }
         WriteFile(directory / "shader.spv", reinterpret_cast<const char*>(shader.spirv.data()), shader.spirv.size() * sizeof(std::uint32_t));
         WriteFile(directory / "push_constants.bin", reinterpret_cast<const char*>(pushConstants.data()), pushConstants.size());
         WriteFile(directory / "input.json", metadata.data(), metadata.size());
         ++count;
         bytes += total + metadata.size();
-        std::fprintf(stderr, "[gpu-atomic-input] captured sequence %u program 0x%llx (%zu images): %s\n", count, static_cast<unsigned long long>(program), copies.size(), directory.string().c_str());
+        std::fprintf(stderr, "[gpu-atomic-input] captured sequence %u program 0x%llx (%zu images, %zu guest buffers): %s\n", count, static_cast<unsigned long long>(program), copies.size(), buffers.size(), directory.string().c_str());
         return count;
     } catch (const std::exception& error) {
         stopped = true;
