@@ -1140,7 +1140,11 @@ void ShaderResources::buildComplete() {
                 switch (binding.layout.descriptorType) {
                     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
                         write.pBufferInfo = buffers.data() + buffers.size();
-                        for (const auto index : binding.allocations) buffers.push_back(descriptor(allocations[index]));
+                        for (const auto index : binding.allocations) {
+                            auto& allocation = allocations[index];
+                            allocation.gpuView = descriptor(allocation);
+                            buffers.push_back(allocation.gpuView);
+                        }
                         break;
                     case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
                         write.pImageInfo = images.data() + images.size();
@@ -3083,6 +3087,18 @@ std::vector<ShaderResources::AtomicImage> ShaderResources::AtomicImages() const 
         }
     }
     return images;
+}
+
+std::vector<ShaderResources::GuestBufferView> ShaderResources::BoundGuestBuffers() const {
+    std::vector<GuestBufferView> result;
+    for (const auto& binding : bindings) {
+        if (binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) continue;
+        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            const auto& allocation = allocations[binding.allocations[element]];
+            if (allocation.guest) result.push_back({binding.layout.binding, static_cast<std::uint32_t>(element), allocation.address, allocation.size, allocation.adjustment, allocation.gpuView});
+        }
+    }
+    return result;
 }
 
 }
