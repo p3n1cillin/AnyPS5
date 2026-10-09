@@ -1831,7 +1831,17 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         }
         const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
         const auto* source = live ? reinterpret_cast<const std::byte*>(snapshot.address) : owner->snapshot.data() + offset;
-        Require(std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0, "guest snapshot differs from registered memory");
+        if (std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) != 0) {
+            const auto difference = std::mismatch(snapshot.bytes.begin(), snapshot.bytes.end(), source);
+            const auto index = static_cast<std::size_t>(difference.first - snapshot.bytes.begin());
+            const auto expected = index < snapshot.bytes.size() ? std::to_integer<unsigned>(*difference.first) : 0u;
+            const auto actual = index < snapshot.bytes.size() ? std::to_integer<unsigned>(*difference.second) : 0u;
+            char message[384];
+            std::snprintf(message, sizeof(message), "guest snapshot differs from registered memory: range=0x%llx+0x%zx owner=[0x%llx,0x%llx) live=%u writable=%u host_backed=%u mirror=%u mismatch=0x%zx expected=0x%02x actual=0x%02x",
+                static_cast<unsigned long long>(snapshot.address), snapshot.bytes.size(), static_cast<unsigned long long>(owner->begin), static_cast<unsigned long long>(owner->end),
+                static_cast<unsigned>(live), static_cast<unsigned>(owner->writable), static_cast<unsigned>(owner->hostBacked), static_cast<unsigned>(owner->mirror != nullptr), index, expected, actual);
+            Require(false, message);
+        }
         if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
         return;
     }
