@@ -926,6 +926,9 @@ private:
         image.lineCompatible = image.lineCompatible && lineShape && (lineSample || lineAccess);
         image.lineSampleCompatible = image.lineSampleCompatible && lineShape && lineSample;
         image.depthBitsCompatible = image.depthBitsCompatible && memory.dataBits == 32u;
+        const bool flatVolumeLoad = op == IrOpcode::ImageRead && !memory.imageHasMip && memory.imageSampleFlags == 0u;
+        const bool flatVolumeSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero;
+        image.flatVolumeCompatible = image.flatVolumeCompatible && (flatVolumeLoad || flatVolumeSample) && !memory.imagePacked && memory.imageByElements == 0u;
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
             if (op == IrOpcode::ImageGatherRaw || (memory.imageSampleFlags & unsupported) != 0u) image.emulatedCompare |= EmulatedCompare::Unsupported;

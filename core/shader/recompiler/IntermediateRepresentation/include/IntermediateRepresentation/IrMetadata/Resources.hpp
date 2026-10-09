@@ -85,6 +85,7 @@ struct ImageResource {
     bool lineCompatible = true;
     bool lineSampleCompatible = true;
     bool depthBitsCompatible = true;
+    bool flatVolumeCompatible = true;
     std::uint32_t byElements = 0;
     std::uint32_t byComponents = 0;
     IrBufferFormat packedFormat = IrBufferFormat::Invalid;

@@ -197,6 +197,7 @@ CompiledVariant sampleVariant() {
     image.lineCompatible = false;
     image.lineSampleCompatible = false;
     image.depthBitsCompatible = false;
+    image.flatVolumeCompatible = false;
     image.byElements = 4;
     image.byComponents = 1;
     image.indirectRoot = 0;
