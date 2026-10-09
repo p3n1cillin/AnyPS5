@@ -52,9 +52,20 @@ alignas(256) constexpr std::array<std::uint32_t, 13> Code{
     0x34160082, 0xe0701000, 0x8001040b, 0xbf810000, 0xbf810000, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 15> ArrayCode{
+    0x1614008c, 0xe03c1000, 0x8000010a, 0xbf8c3f70, 0x7e0802ff, 0x41100000, 0xf0bc0128,
+    0x00820401, 0xbf8c3f70, 0x34160082, 0xe0701000, 0x8001040b, 0xbf810000, 0xbf810000, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 16> OffsetCode{
     0x1614008c, 0xe03c1000, 0x8000030a, 0xe03c1000, 0x8005060a, 0xbf8c3f70, 0x7e020306, 0x7e040307,
     0x7e0c0308, 0xf0f80108, 0x00820901, 0xbf8c3f70, 0x34160082, 0xe0701000, 0x8001090b, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 18> ArrayOffsetCode{
+    0x1614008c, 0xe03c1000, 0x8000030a, 0xe03c1000, 0x8005060a, 0xbf8c3f70, 0x7e020306, 0x7e040307,
+    0x7e0e0308, 0x7e0c02ff, 0x41100000, 0xf0f80128, 0x00820901, 0xbf8c3f70, 0x34160082, 0xe0701000,
+    0x8001090b, 0xbf810000,
 };
 
 struct Sampler {
@@ -191,10 +202,10 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::
     return ShaderRecompiler::Recompile(request);
 }
 
-void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* name, bool offsets = false, bool useCache = false) {
+void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* name, bool offsets = false, bool useCache = false, bool arrayed = false) {
     Output.fill(-1.0f);
-    const std::span<const std::uint32_t> code = offsets ? std::span<const std::uint32_t>(OffsetCode) : std::span<const std::uint32_t>(Code);
-    const auto result = Compile(device, Format8888UNorm, sampler, code, useCache);
+    const std::span<const std::uint32_t> code = offsets ? (arrayed ? std::span<const std::uint32_t>(ArrayOffsetCode) : std::span<const std::uint32_t>(OffsetCode)) : arrayed ? std::span<const std::uint32_t>(ArrayCode) : std::span<const std::uint32_t>(Code);
+    const auto result = Compile(device, Format8888UNorm, sampler, code, useCache, !(arrayed && offsets));
     for (const auto& binding : result.bindings) {
         Require(binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers, "emulated comparison retained a sampler binding");
         Require(std::all_of(binding.imageSamplers.begin(), binding.imageSamplers.end(), [](auto mask) { return mask == 0u; }), "emulated comparison retained an unused sampler association");
@@ -236,6 +247,8 @@ int main() {
         Require(!BindsDepthCompare(Compile(*device, Format8888UNorm, {ClampEdge, FilterBilinear})), "a color texture kept a depth-compare binding");
         Run(*device, {ClampEdge, FilterPoint}, "point, clamp to edge");
         Run(*device, {ClampEdge, FilterBilinear}, "bilinear, clamp to edge");
+        Run(*device, {ClampEdge, FilterPoint}, "array comparison on a plain 2D image, point", false, false, true);
+        Run(*device, {ClampEdge, FilterBilinear}, "array comparison on a plain 2D image, bilinear", false, false, true);
         Run(*device, {ClampWrap, FilterBilinear}, "bilinear, wrap");
         Run(*device, {ClampBorder, FilterPoint, BorderWhite}, "point, white border");
         Run(*device, {ClampBorder, FilterPoint, BorderBlack}, "point, black border");
@@ -244,10 +257,13 @@ int main() {
         Run(*device, {ClampEdge, FilterPoint, BorderBlack, 0u, 0x0140u}, "point, clamp to edge, sampler LOD bias");
         Run(*device, {ClampEdge, FilterPoint}, "point, clamp to edge, offsets, bias and LOD clamp", true);
         Run(*device, {ClampWrap, FilterBilinear}, "bilinear, wrap, offsets, bias and LOD clamp", true);
+        Run(*device, {ClampEdge, FilterPoint}, "array comparison on a plain 2D image with offsets, point", true, false, true);
+        Run(*device, {ClampWrap, FilterBilinear}, "array comparison on a plain 2D image with offsets, bilinear", true, false, true);
         Run(*device, {ClampBorder, FilterBilinear, BorderWhite, 0u, 0x3f00u}, "bilinear, white border, offsets, bias and LOD clamp", true);
         for (unsigned iteration = 0; iteration < 2; ++iteration) {
             Run(*device, {ClampEdge, FilterPoint}, "cached point comparison", false, true);
             Run(*device, {ClampWrap, FilterBilinear}, "cached bilinear comparison with offsets", true, true);
+            Run(*device, {ClampEdge, FilterPoint}, "cached array comparison on a plain 2D image", false, true, true);
         }
         Reject(*device, Format32Float, {ClampEdge, FilterPoint}, "native comparison with a nonconstant texel offset requires", OffsetCode, false);
         Reject(*device, Format8888UInt, {ClampEdge, FilterPoint}, "unsupported format");
