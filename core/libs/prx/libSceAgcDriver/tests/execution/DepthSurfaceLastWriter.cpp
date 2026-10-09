@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
@@ -17,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -165,6 +169,46 @@ bool Refused(const Context& context, const GuestTextureResource& resource) {
     return false;
 }
 
+void ExpectStorage(const Context& context, const StorageTexture& storage, float expected) {
+    Buffer pixels(context, Extent.width * Extent.height * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch batch(context);
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {Extent.width, Extent.height, 1};
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), storage.Image(), VK_IMAGE_LAYOUT_GENERAL, pixels.Handle(), 1, &region);
+    batch.SubmitAndWait();
+    pixels.Invalidate();
+    for (std::size_t offset = 0; offset < pixels.Bytes().size(); offset += sizeof(float)) {
+        float actual;
+        std::memcpy(&actual, pixels.Bytes().data() + offset, sizeof(actual));
+        Require(actual == expected, "depth and storage image transfers changed the depth value");
+    }
+}
+
+void StorageRoundTrip(const Context& context, std::uint64_t address) {
+    auto target = Depth(address);
+    target.clearDepth = 0.25f;
+    DepthSurfaceView(context, target);
+    TextureDetiler detiler(context);
+    auto storage = std::make_shared<StorageTexture>(context, detiler, View(Extent.width, Extent.height, address), 0);
+    SeedStorageFromDepth(context, storage);
+    ExpectStorage(context, *storage, 0.25f);
+    {
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue clear{{0.75f, 0.0f, 0.0f, 0.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(batch.Handle(), storage->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        batch.SubmitAndWait();
+    }
+    DepthSurfaceView(context, target);
+    auto copy = std::make_shared<StorageTexture>(context, detiler, View(Extent.width, Extent.height, address), 0);
+    SeedStorageFromDepth(context, copy);
+    ExpectStorage(context, *copy, 0.75f);
+    Require(DepthSurfaceAt(address), "a genuine depth storage write retired the depth surface");
+}
+
 void Run(const Context& context) {
     const auto wide = View(2 * Extent.width, Extent.height);
     const auto exact = View(Extent.width, Extent.height);
@@ -233,6 +277,16 @@ void Run(const Context& context) {
     Require(Refused(context, watchedWide), "a driver store past the depth plane retired the depth surface");
     AgcDriver::GuestMemory::MarkWritten(watched + 0x100, 4);
     Require(Sample(context, watchedWide) == nullptr, "depth, then a driver store, then a view of another extent: the view was not left to guest memory");
+
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(const_cast<std::uint8_t*>(memory), 2 * Block, true, true);
+    }
+    StorageRoundTrip(context, watched + Block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(const_cast<std::uint8_t*>(memory));
+    }
 }
 
 }
