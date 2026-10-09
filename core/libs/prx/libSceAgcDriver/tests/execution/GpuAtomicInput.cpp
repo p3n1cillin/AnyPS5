@@ -103,6 +103,11 @@ bool Run(AgcDriver::VulkanDevice& device, const std::filesystem::path& directory
     Environment("APS5_DUMP_ATOMIC_INPUT_LIMIT", "65");
     Require(AgcDriver::GpuAtomicCapture::ReadOptions().program == 0, "oversized count enabled GPU capture");
     Environment("APS5_DUMP_ATOMIC_INPUT_LIMIT", "2");
+    Environment("APS5_DUMP_ATOMIC_INPUT_BUFFERS", "0:0,0:0");
+    Require(AgcDriver::GpuAtomicCapture::ReadOptions().program == 0, "duplicate buffer selection enabled GPU capture");
+    Environment("APS5_DUMP_ATOMIC_INPUT_BUFFERS", "0:0,");
+    Require(AgcDriver::GpuAtomicCapture::ReadOptions().program == 0, "trailing buffer selection comma enabled GPU capture");
+    Environment("APS5_DUMP_ATOMIC_INPUT_BUFFERS", "0:0");
     Environment("APS5_DUMP_ATOMIC_INPUT_DIR", directory.string());
     Output.fill(0xdeadbeefu);
     std::fill(texels.begin(), texels.end(), 0u);
@@ -145,8 +150,19 @@ bool Run(AgcDriver::VulkanDevice& device, const std::filesystem::path& directory
         Require(value == 17u + 2u * index, "GPU snapshot missed preceding queued atomic writes");
         Require(std::all_of(data.begin() + 4, data.end(), [](char byte) { return byte == 0; }), "GPU snapshot changed untouched texels");
         const auto metadata = Read(capture / "input.json");
-        Require(metadata.find("\"synchronized\":true") != std::string::npos && metadata.find("\"captures_guest_buffers\":false") != std::string::npos, "GPU snapshot metadata misrepresents capture");
+        Require(metadata.find("\"synchronized\":true") != std::string::npos && metadata.find("\"captures_guest_buffers\":true") != std::string::npos && metadata.find("\"captures_all_guest_buffers\":false") != std::string::npos, "GPU snapshot metadata misrepresents capture");
         Require(Read(capture / "shader.spv").size() == result.spirv.size() * 4u, "GPU snapshot missed selected shader");
+        const auto output = Read(capture / "buffer_0_0.bin");
+        Require(output.size() == Output.size() * 4u, "GPU buffer snapshot has the wrong range");
+        const auto word = [&](unsigned offset) {
+            std::uint32_t result = 0;
+            for (unsigned byte = 0; byte < 4; ++byte) result |= static_cast<std::uint32_t>(static_cast<unsigned char>(output[offset * 4u + byte])) << (byte * 8u);
+            return result;
+        };
+        for (unsigned lane = 0; lane < 64; ++lane) {
+            const auto ticket = 17u + 2u * (index - 1u) + lane / 32u;
+            Require(word(lane * 2u) == ticket && word(lane * 2u + 1u) == 123u + (ticket & 3u), "GPU buffer snapshot missed preceding dispatch writes");
+        }
     }
     for (unsigned lane = 0; lane < 64; ++lane) {
         const auto ticket = 23u + lane / 32u;

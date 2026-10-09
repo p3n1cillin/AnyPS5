@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <mutex>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver {
 
@@ -15,6 +17,7 @@ struct GpuAtomicCaptureOptions {
     std::uint32_t limit = 8;
     std::uint64_t byteBudget = 64u * 1024u * 1024u;
     std::filesystem::path directory = ".";
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> buffers;
 };
 
 class GpuAtomicCapture {
