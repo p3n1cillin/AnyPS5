@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -17,8 +18,12 @@ void Driver::traceCaptureStability(const char* phase, std::uint64_t program, std
         return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
     }();
     if (selected == 0 || selected != program) return;
+    static const unsigned limit = [] {
+        const auto* text = std::getenv("APS5_TRACE_CAPTURE_STATE_LIMIT");
+        return static_cast<unsigned>(std::clamp(text != nullptr ? std::strtoull(text, nullptr, 10) : 128ull, 1ull, 4096ull));
+    }();
     static std::atomic<unsigned> traces{0};
-    if (traces.fetch_add(1, std::memory_order_relaxed) >= 128u) return;
+    if (traces.fetch_add(1, std::memory_order_relaxed) >= limit) return;
     std::size_t differing = 0, unmapped = 0;
     std::vector<std::byte> live;
     for (const auto& region : regions) {
