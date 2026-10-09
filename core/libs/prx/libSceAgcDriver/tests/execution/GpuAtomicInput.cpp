@@ -88,11 +88,11 @@ struct GuestBlock {
         }
 };
 
-void Run(AgcDriver::VulkanDevice& device, const std::filesystem::path& directory) {
+bool Run(AgcDriver::VulkanDevice& device, const std::filesystem::path& directory) {
     GuestBlock block;
     const std::span<std::uint32_t> texels(static_cast<std::uint32_t*>(block.data), GuestBlock::Size / 4u);
     const std::array<std::uint32_t, 4> zero{};
-    Require(device.FillBuffer(reinterpret_cast<std::uintptr_t>(block.data), GuestBlock::Size, zero), "GPU capture test needs a host import");
+    if (!device.FillBuffer(reinterpret_cast<std::uintptr_t>(block.data), GuestBlock::Size, zero)) return false;
     device.WaitIdle();
     const auto address = reinterpret_cast<std::uintptr_t>(Code);
     std::ostringstream addressText;
@@ -155,6 +155,7 @@ void Run(AgcDriver::VulkanDevice& device, const std::filesystem::path& directory
     std::array<std::uint32_t, 1> counter{};
     AgcDriver::GuestMemory::Read(textureAddress, std::as_writable_bytes(std::span(counter)), 4);
     Require(counter[0] == 25u, "GPU capture altered final atomic counter");
+    return true;
 }
 
 }
@@ -168,8 +169,12 @@ int main() {
         if (device->Target().subgroupSize < 32u) return VulkanTestSkipped;
         directory = std::filesystem::temp_directory_path() / ("aps5-gpu-atomic-input-test-" + std::to_string(std::random_device{}()));
         Require(std::filesystem::create_directory(directory), "GPU capture test directory already exists");
-        Run(*device, directory);
-        std::puts("GPU atomic input capture tests passed");
+        if (Run(*device, directory)) {
+            std::puts("GPU atomic input capture tests passed");
+        } else {
+            std::puts("skipped, the device does not import guest memory");
+            result = VulkanTestSkipped;
+        }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         result = 1;
