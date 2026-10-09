@@ -14,12 +14,14 @@ struct PipelineSpecializationConstant {
 
 namespace PipelineSpecialization {
 
+inline constexpr std::uint32_t SamplerBase = 51200u;
+inline constexpr std::uint32_t SamplerWords = 4u;
 inline constexpr std::uint32_t CompareBase = 49152u;
 inline constexpr std::uint32_t CompareWords = 6u;
 inline constexpr std::uint32_t BufferBase = 0u;
 inline constexpr std::uint32_t BufferWords = 4u;
 inline constexpr std::uint32_t ImageBase = 1024u;
-inline constexpr std::uint32_t ImageWords = 5u;
+inline constexpr std::uint32_t ImageWords = 6u;
 inline constexpr std::uint32_t VertexBase = 4096u;
 inline constexpr std::uint32_t VertexWords = 6u;
 inline constexpr std::uint32_t PushDataOffset = 8188u;

@@ -919,9 +919,12 @@ private:
         image.atomic = image.atomic || atomic;
         image.srgbDecodeCompatible = image.srgbDecodeCompatible && !ImageOpcodeInfoOf(op).needsSampler;
         image.fmaskCompatible = image.fmaskCompatible && op == IrOpcode::ImageRead && memory.dataBits == 32u;
-        image.lineCompatible = image.lineCompatible && (op == IrOpcode::ImageRead || op == IrOpcode::ImageWrite) &&
-            memory.imageDimension == RdnaImageDimension::Dim2D && memory.dataBits == 32u && memory.dmask == 0xfu &&
-            !memory.imageHasMip && !memory.imageR128 && !memory.imagePacked && memory.imageByElements == 0u && memory.imageSampleFlags == 0u;
+        const bool lineShape = memory.imageDimension == RdnaImageDimension::Dim2D && memory.dataBits == 32u && memory.dmask != 0u &&
+            !memory.imageHasMip && !memory.imageR128 && !memory.imagePacked && memory.imageByElements == 0u;
+        const bool lineSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero && memory.dmask == 0xfu;
+        const bool lineAccess = (op == IrOpcode::ImageRead || (op == IrOpcode::ImageWrite && memory.dmask == 0xfu)) && memory.imageSampleFlags == 0u;
+        image.lineCompatible = image.lineCompatible && lineShape && (lineSample || lineAccess);
+        image.lineSampleCompatible = image.lineSampleCompatible && lineShape && lineSample;
         image.depthBitsCompatible = image.depthBitsCompatible && memory.dataBits == 32u;
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;

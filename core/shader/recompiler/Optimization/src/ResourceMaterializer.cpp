@@ -570,6 +570,20 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
         if (decoded.Type() != 0u) throw std::runtime_error("buffer descriptor uses an unsupported type");
         if (plan.stage != IrShaderStage::Compute && decoded.AddTid()) throw std::runtime_error("buffer ADD_TID is only valid for compute shaders");
     }
+    for (const auto& pair : plan.info.sampledPairs) {
+        const auto& image = plan.info.images.at(pair.image);
+        const auto& descriptor = snapshot.images.at(pair.image);
+        if (image.dimension != RdnaImageDimension::Dim2D || rawImageType(descriptor) != ImageType::Color1D || !image.lineCompatible) continue;
+        const auto& words = snapshot.samplers.at(pair.sampler).dwords;
+        const auto clamp = words[0] & 7u;
+        const auto mag = (words[2] >> 20u) & 3u;
+        const auto min = (words[2] >> 22u) & 3u;
+        if ((words[0] & ~0x71ffu) != 0u || (words[1] & 0xff000fffu) != 0u ||
+            words[2] != (mag == 0u ? 0x04000000u : 0x06500000u) ||
+            mag != min || mag > 1u || (clamp != 0u && clamp != 1u && clamp != 2u && clamp != 6u) || words[3] != 0u) {
+            throw std::runtime_error("unmeasured sampler for a 2D level-zero sample of a 1D image");
+        }
+    }
     if (snapshot.flattenedSrt.size() != plan.srtReads.size()) throw std::runtime_error("runtime SRT size differs from the static interface");
     for (std::uint32_t i = 0u; i < plan.info.images.size(); ++i) {
         const auto& image = plan.info.images[i];
@@ -739,7 +753,8 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
     if (decoded.mipCount > (image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageHeapCapacity : 1u)) throw std::runtime_error("runtime storage image mip capacity exceeded");
     const bool unmeasuredLine = image.dimension == RdnaImageDimension::Dim2D && decoded.dimension == RdnaImageDimension::Dim1D &&
         (!image.lineCompatible || rawImageType(descriptor) != ImageType::Color1D ||
-        (format != IrBufferFormat::Format32Float && format != IrBufferFormat::Format32_32_32_32Float) || descriptorImageSwizzle(descriptor) != ShaderImageIdentitySwizzle ||
+        (format != IrBufferFormat::Format32Float && format != IrBufferFormat::Format32_32_32_32Float &&
+        !(image.lineSampleCompatible && format == IrBufferFormat::Format16_16_16_16Float)) || descriptorImageSwizzle(descriptor) != ShaderImageIdentitySwizzle ||
         ((descriptor.dwords[3] >> 12u) & 0xffu) != 0u || ((descriptor.dwords[2] >> 14u) & 0x3fffu) != 0u || descriptor.dwords[4] != 0u || ((descriptor.dwords[5] >> 4u) & 0xfu) != 0u);
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         if (unmeasuredLine) continue;

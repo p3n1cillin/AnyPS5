@@ -474,6 +474,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.packed);
         out.Value(image.fmaskCompatible);
         out.Value(image.lineCompatible);
+        out.Value(image.lineSampleCompatible);
         out.Value(image.depthBitsCompatible);
         out.Value(image.byElements);
         out.Value(image.byComponents);
@@ -576,6 +577,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.packed);
         in.Value(image.fmaskCompatible);
         in.Value(image.lineCompatible);
+        in.Value(image.lineSampleCompatible);
         in.Value(image.depthBitsCompatible);
         in.Value(image.byElements);
         in.Value(image.byComponents);

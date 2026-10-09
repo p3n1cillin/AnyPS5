@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -129,9 +130,46 @@ void RunDimension(AgcDriver::VulkanDevice& device, std::uint32_t dimension) {
     }
 }
 
+void RunPartialLoads(AgcDriver::VulkanDevice& device) {
+    for (const auto dimension : {1u, 2u}) {
+        for (std::uint32_t mask = 1u; mask <= 15u; ++mask) {
+            std::vector<std::uint32_t> code(Load.begin(), Load.end());
+            code.insert(code.begin() + 4, {0x7e0802ffu, 0xcdcdcdcdu, 0x7e0a02ffu, 0xcdcdcdcdu, 0x7e0c02ffu, 0xcdcdcdcdu, 0x7e0e02ffu, 0xcdcdcdcdu});
+            code[12] = 0xf0000000u | (mask << 8u) | (dimension == 1u ? 0u : 8u);
+            for (const auto format : {22u, 77u}) {
+                const auto channels = format == 22u ? 1u : 4u;
+                for (const auto width : {1u, 8u}) {
+                    Fill(width, channels);
+                    for (const auto y : {0u, 1u, 0xffffffffu}) {
+                        const std::array<std::uint32_t, 4> xs{0u, width - 1u, width, 0xffffffffu};
+                        for (std::uint32_t lane = 0u; lane < Threads; ++lane) {
+                            Input[lane * 2u] = xs[lane % xs.size()];
+                            Input[lane * 2u + 1u] = y;
+                        }
+                        Output.fill(0xdeadbeefu);
+                        const auto shader = Compile(device, code, Texture(width, format), Threads);
+                        device.Dispatch(shader, 1u, 1u, 1u);
+                        device.WaitIdle();
+                        for (std::uint32_t lane = 0u; lane < Threads; ++lane) {
+                            std::array<std::uint32_t, 4> expected{0xcdcdcdcdu, 0xcdcdcdcdu, 0xcdcdcdcdu, 0xcdcdcdcdu};
+                            std::uint32_t destination = 0u;
+                            const auto x = Input[lane * 2u];
+                            for (std::uint32_t component = 0u; component < 4u; ++component) {
+                                if ((mask & (1u << component)) != 0u) expected[destination++] = x < width ? Texels[x * channels + component % channels] : 0u;
+                            }
+                            for (std::uint32_t component = 0u; component < 4u; ++component) Require(Output[lane * 4u + component] == expected[component], "partial line load differs from native RDNA2: dim=" + std::to_string(dimension) + " mask=" + std::to_string(mask) + " component=" + std::to_string(component));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void Run(AgcDriver::VulkanDevice& device) {
     RunDimension(device, 1u);
     RunDimension(device, 2u);
+    RunPartialLoads(device);
     auto mipLoad = Load;
     mipLoad[4] += 0x00040000u;
     Reject(device, mipLoad, Texture(8u, 77u));
@@ -141,9 +179,6 @@ void Run(AgcDriver::VulkanDevice& device) {
     auto narrowAddress = Load;
     narrowAddress[5] |= 0x40000000u;
     Reject(device, narrowAddress, Texture(8u, 77u));
-    auto partialLoad = Load;
-    partialLoad[4] = 0xf0000108u;
-    Reject(device, partialLoad, Texture(8u, 77u));
     auto partialStore = Store;
     partialStore[12] = 0xf0200108u;
     Reject(device, partialStore, Texture(8u, 77u));
