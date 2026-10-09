@@ -289,10 +289,31 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (info.images[index].indirectRoot != ImageResource::NoIndirectImage) continue;
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;
         plan.specialization.push_back({first, imageModes[index]});
+        const auto format = (snapshot.images.at(index).dwords[1] >> 20u) & 0x1ffu;
+        const auto& mode = info.runtimeImageModes.at(index).at(imageModes[index]);
+        plan.specialization.push_back({first + 5u, mode.dimension == RdnaImageDimension::Dim1D && format == 71u ? format : 0u});
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
     }
     for (std::uint32_t target = 0; target < exportMappings.size(); ++target) {
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({PipelineSpecialization::ExportBase + target * 4u + component, (exportMappings[target] >> (component * 2u)) & 3u});
+    }
+    std::vector<bool> linePrecisionSamplers(info.samplers.size(), false);
+    for (const auto& pair : info.sampledPairs) {
+        const auto usesPrecision = [&](std::uint32_t image) {
+            return info.runtimeImageModes.at(image).at(imageModes[image]).dimension == RdnaImageDimension::Dim1D && ((snapshot.images.at(image).dwords[1] >> 20u) & 0x1ffu) == 71u;
+        };
+        const auto& image = info.images.at(pair.image);
+        if (image.indirectRoot == ImageResource::NoIndirectImage) linePrecisionSamplers.at(pair.sampler) = linePrecisionSamplers.at(pair.sampler) || usesPrecision(pair.image);
+        else for (const auto slot : info.images.at(image.indirectRoot).indirectResources) linePrecisionSamplers.at(pair.sampler) = linePrecisionSamplers.at(pair.sampler) || usesPrecision(slot);
+    }
+    for (std::uint32_t index = 0; index < info.samplers.size(); ++index) {
+        const auto& descriptor = snapshot.samplers.at(index);
+        const auto first = PipelineSpecialization::SamplerBase + index * PipelineSpecialization::SamplerWords;
+        const auto word = [&](std::uint32_t field) { return linePrecisionSamplers[index] ? descriptor.dwords[field] : 0u; };
+        plan.specialization.push_back({first, word(0u)});
+        plan.specialization.push_back({first + 1u, word(2u)});
+        plan.specialization.push_back({first + 2u, word(3u)});
+        plan.specialization.push_back({first + 3u, word(1u)});
     }
     std::vector<std::uint32_t> samplerModes(info.samplers.size(), 0u);
     const auto samplerMode = [](const ImageResource& image) { return image.numericClass == IrTextureNumericClass::Sint || image.conversionFormat != IrBufferFormat::Invalid || image.depthBits ? 2u : 1u; };

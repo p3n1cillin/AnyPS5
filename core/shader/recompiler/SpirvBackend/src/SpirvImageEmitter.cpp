@@ -1358,6 +1358,53 @@ void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess
     ctx.Define(access.inst, TableResult(ctx, access, ResultVector(ctx, access, result, setup.numericClass, true, false)));
 }
 
+std::uint32_t EmitLinearLineSample(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup, std::uint32_t samplerWord) {
+    auto& state = ctx.state;
+    const auto f32 = TypeF32(state);
+    const auto i32 = TypeI32(state);
+    const auto vector = TypeF32Vector(state, 4u);
+    const auto ext = [&](std::uint32_t type, std::uint32_t op, std::initializer_list<std::uint32_t> operands) {
+        const auto id = state.module.AllocateId();
+        std::vector<std::uint32_t> words{spv::OpExtInst, type, id, GlslStd450(state), op};
+        words.insert(words.end(), operands.begin(), operands.end());
+        state.module.AddFunction(words);
+        return id;
+    };
+    const auto equal = [&](std::uint32_t value, std::uint32_t literal) { return Binary(state, spv::OpIEqual, TypeBool(state), value, ConstantU32(state, literal)); };
+    const auto descriptor = LoadSampledImageDescriptor(state, access.mem.resource, access.slot);
+    state.module.EmitCapability(spv::CapabilityImageQuery);
+    const auto size = state.module.AllocateId();
+    state.module.AddFunction(spv::OpImageQuerySizeLod, TypeU32(state), size, descriptor, ConstantU32(state, 0u));
+    const auto width = Unary(state, spv::OpBitcast, i32, size);
+    const auto position = Binary(state, spv::OpFSub, f32, Binary(state, spv::OpFMul, f32, setup.coord, Unary(state, spv::OpConvertUToF, f32, size)), ConstantF32Value(state, 0.5f));
+    const auto low = ext(f32, GLSLstd450Floor, {position});
+    const auto fraction = Binary(state, spv::OpFSub, f32, position, low);
+    const auto weight = Binary(state, spv::OpFMul, f32, ext(f32, GLSLstd450RoundEven, {Binary(state, spv::OpFMul, f32, fraction, ConstantF32Value(state, 256.0f))}), ConstantF32Value(state, 1.0f / 256.0f));
+    const auto first = Unary(state, spv::OpConvertFToS, i32, low);
+    const auto clamp = Binary(state, spv::OpBitwiseAnd, TypeU32(state), samplerWord, ConstantU32(state, 7u));
+    const auto borderColor = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, vector, borderColor, ZeroF32(state), ZeroF32(state), ZeroF32(state), ZeroF32(state));
+    const auto fetch = [&](std::uint32_t index) {
+        const auto period = Binary(state, spv::OpIMul, i32, width, ConstantI32(state, 2));
+        const auto mirrored = Binary(state, spv::OpSMod, i32, index, period);
+        const auto reflected = Select(state, i32, Binary(state, spv::OpSLessThan, TypeBool(state), mirrored, width), mirrored, Binary(state, spv::OpISub, i32, Binary(state, spv::OpISub, i32, period, ConstantI32(state, 1)), mirrored));
+        const auto edge = ext(i32, GLSLstd450SClamp, {index, ConstantI32(state, 0), Binary(state, spv::OpISub, i32, width, ConstantI32(state, 1))});
+        const auto addressed = Select(state, i32, equal(clamp, 0u), Binary(state, spv::OpSMod, i32, index, width), Select(state, i32, equal(clamp, 1u), reflected, edge));
+        const auto texel = state.module.AllocateId();
+        state.module.AddFunction(spv::OpImageFetch, vector, texel, descriptor, addressed, spv::ImageOperandsLodMask, ConstantU32(state, 0u));
+        const auto inside = Binary(state, spv::OpLogicalAnd, TypeBool(state), Binary(state, spv::OpSGreaterThanEqual, TypeBool(state), index, ConstantI32(state, 0)), Binary(state, spv::OpSLessThan, TypeBool(state), index, width));
+        return EmitValueIfElse(state, Binary(state, spv::OpLogicalAnd, TypeBool(state), equal(clamp, 6u), Unary(state, spv::OpLogicalNot, TypeBool(state), inside)), vector, [&] { return borderColor; }, [&] { return texel; });
+    };
+    const auto left = fetch(first);
+    const auto right = fetch(Binary(state, spv::OpIAdd, i32, first, ConstantI32(state, 1)));
+    const auto weights = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, vector, weights, weight, weight, weight, weight);
+    const auto inverse = Binary(state, spv::OpFSub, f32, ConstantF32Value(state, 1.0f), weight);
+    const auto inverses = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, vector, inverses, inverse, inverse, inverse, inverse);
+    return Binary(state, spv::OpFAdd, vector, Binary(state, spv::OpFMul, vector, left, inverses), Binary(state, spv::OpFMul, vector, right, weights));
+}
+
 void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup) {
     auto& state = ctx.state;
     const auto& mem = access.mem;
@@ -1447,7 +1494,24 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         words.insert(words.end(), operands.begin(), operands.end());
     }
     state.module.AddFunction(words);
-    const auto result = setup.dref ? sample : UnpackImageTexel(ctx, access, sample);
+    auto filtered = sample;
+    if (!setup.dref && image.dimension == RdnaImageDimension::Dim1D && image.numericClass == IrTextureNumericClass::Float && mem.imageSampleFlags == RdnaImageSampleFlagLevelZero && mem.dataBits == 32u && mem.dmask == 0xfu && !mem.imageR128 && !mem.imagePacked && mem.imageByElements == 0u) {
+        const auto samplerParameter = [&](std::uint32_t word) { return state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::SamplerBase + mem.sampler * PipelineSpecialization::SamplerWords + word, 0u); };
+        const auto format = image.indirectRoot == ImageResource::NoIndirectImage ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + mem.resource * PipelineSpecialization::ImageWords + 5u, 0u) : Binary(state, spv::OpBitwiseAnd, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeU32(state), RuntimeImageDword(state, mem.resource, offsetof(RuntimeAbi::ResourceMetadata, descriptor) / sizeof(std::uint32_t) + 1u), ConstantU32(state, 20u)), ConstantU32(state, 0x1ffu));
+        const auto equal = [&](std::uint32_t value, std::uint32_t literal) { return Binary(state, spv::OpIEqual, TypeBool(state), value, ConstantU32(state, literal)); };
+        const auto samplerWord = samplerParameter(0u);
+        const auto clamp = Binary(state, spv::OpBitwiseAnd, TypeU32(state), samplerWord, ConstantU32(state, 7u));
+        auto addressing = equal(clamp, 0u);
+        for (const auto mode : {1u, 2u, 6u}) addressing = Binary(state, spv::OpLogicalOr, TypeBool(state), addressing, equal(clamp, mode));
+        const auto normal = equal(Binary(state, spv::OpBitwiseAnd, TypeU32(state), samplerWord, ConstantU32(state, ~0x71ffu)), 0u);
+        const auto linear = equal(Binary(state, spv::OpBitwiseAnd, TypeU32(state), samplerParameter(1u), ConstantU32(state, 0xfu << 20u)), 5u << 20u);
+        const auto border = equal(samplerParameter(2u), 0u);
+        const auto zeroMinLod = equal(Binary(state, spv::OpBitwiseAnd, TypeU32(state), samplerParameter(3u), ConstantU32(state, 0xfffu)), 0u);
+        auto enabled = Binary(state, spv::OpLogicalAnd, TypeBool(state), equal(format, 71u), linear);
+        for (const auto predicate : {addressing, normal, border, zeroMinLod}) enabled = Binary(state, spv::OpLogicalAnd, TypeBool(state), enabled, predicate);
+        filtered = EmitValueIfElse(state, enabled, resultType, [&] { return EmitLinearLineSample(ctx, access, setup, samplerWord); }, [&] { return sample; });
+    }
+    const auto result = setup.dref ? filtered : UnpackImageTexel(ctx, access, filtered);
     ctx.Define(access.inst, TableResult(ctx, access, ResultVector(ctx, access, result, setup.numericClass, setup.dref, false)));
 }
 
