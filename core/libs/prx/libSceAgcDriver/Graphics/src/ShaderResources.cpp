@@ -3060,4 +3060,14 @@ bool ShaderResources::ReadsImage(const StorageTexture* image) const {
     return std::any_of(storageTextures.begin(), storageTextures.end(), [&](const auto& storage) { return storage.get() == image; });
 }
 
+std::vector<ShaderResources::AtomicImage> ShaderResources::AtomicImages() const {
+    std::vector<AtomicImage> images;
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageTextures[index] != nullptr && (storageAtomic[index] || storageAtomic64[index])) {
+            images.push_back({storageTextures[index], storageMips[index], storageFirstLayer[index], index});
+        }
+    }
+    return images;
+}
+
 }

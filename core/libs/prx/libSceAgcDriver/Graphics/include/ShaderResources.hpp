@@ -144,6 +144,13 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& GpuWrites() const { return guestMemory.Writes(); }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
+    struct AtomicImage {
+        std::shared_ptr<StorageTexture> texture;
+        std::uint32_t mip;
+        bool firstLayer;
+        std::size_t storageElement;
+    };
+    std::vector<AtomicImage> AtomicImages() const;
     // Whether a use writes guest memory beyond a draw's attachments (storage images, written or
     // copied buffers, an address-based build's unknown writes), or reads `image` (a view of it
     // sampled, or the image itself bound): a recorded draw's render pass may only be continued by
