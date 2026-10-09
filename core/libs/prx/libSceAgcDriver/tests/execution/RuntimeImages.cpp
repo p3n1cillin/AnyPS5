@@ -44,6 +44,44 @@ void Run(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void CheckIndependentSelections(AgcDriver::VulkanDevice& device) {
+    constexpr std::array<std::uint32_t, 33> independentCode{
+        0x340c0082u, 0xf4000400u, 0xfa000050u, 0xf4000440u, 0xfa000054u, 0xbf8cc07fu,
+        0xbf068010u, 0xbf850003u, 0xf40c0200u, 0xfa000000u, 0xbf820002u, 0xf40c0200u, 0xfa000060u,
+        0xbf068011u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0xfa000030u,
+        0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0x7e0002ffu, 0x3fa00000u, 0x7e0202ffu, 0x3f000000u,
+        0xf09c0108u, 0x00a20200u, 0xbf8c3f70u, 0xe0701000u, 0x80060206u, 0xbf810000u};
+    std::array<std::uint32_t, 32> srt{};
+    for (std::uint32_t texture = 0u; texture < 2u; texture++) {
+        for (std::uint32_t pixel = 0u; pixel < 32u; pixel++) textures[texture][pixel] = 100u * (texture + 1u) + pixel;
+        const auto address = reinterpret_cast<std::uintptr_t>(textures[texture].data());
+        const std::array<std::uint32_t, 8> descriptor{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>(address >> 40u) | (20u << 20u) | (3u << 30u), 7u, (9u << 28u) | 0xfacu, 0u, 0u, 0u, 0u};
+        std::copy(descriptor.begin(), descriptor.end(), srt.begin() + (texture == 0u ? 0u : 24u));
+    }
+    srt[12] = 2u;
+    const auto outputAddress = reinterpret_cast<std::uintptr_t>(output.data());
+    const std::array<std::uint32_t, 4> outputDescriptor{static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>(outputAddress >> 32u), 256u, 0x31016facu};
+    std::copy(outputDescriptor.begin(), outputDescriptor.end(), srt.begin() + 16u);
+    const auto address = reinterpret_cast<std::uintptr_t>(srt.data());
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{address, std::as_bytes(std::span(srt))}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{32u, 1u, 1u}, 0u, {true, false, false}, false, 1u};
+    for (std::uint32_t image = 0u; image < 2u; image++) {
+        for (std::uint32_t sampler = 0u; sampler < 2u; sampler++) {
+            output.fill(0xdeadbeefu);
+            srt[20] = image;
+            srt[21] = sampler;
+            ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(independentCode.data()), independentCode, 0u, {}}, {32u, 0u, userData, compute, std::nullopt, std::nullopt, memory}, device.Target(), {0u, 0u, 0u, 128u}};
+            request.useCache = false;
+            const auto shader = ShaderRecompiler::Recompile(request);
+            device.Dispatch(shader, 1u, 1u, 1u);
+            device.WaitIdle();
+            const auto expected = (image == 0u ? 200u : 100u) + (sampler == 0u ? 31u : 8u);
+            for (std::uint32_t lane = 0u; lane < 32u; lane++) Require(output[lane] == expected, "independent image/sampler selection returned " + std::to_string(output[lane]) + " instead of " + std::to_string(expected));
+        }
+    }
+}
+
 }
 
 int main() {
@@ -51,6 +89,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Run(*device);
+        CheckIndependentSelections(*device);
         std::cout << "runtime image and sampler tests passed\n";
         return 0;
     } catch (const std::exception& error) {
