@@ -1671,6 +1671,17 @@ void Recorder::FlushStores() {
 namespace {
 
 constexpr std::uint32_t MaxTimedRanges = 512;
+std::uint32_t TimedRangeLimit() {
+    static const auto limit = [] {
+        const auto* value = std::getenv("APS5_GPU_TIMED_RANGES");
+        if (value == nullptr) return MaxTimedRanges;
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        Require(end != value && *end == '\0' && parsed >= 1 && parsed <= 16384, "APS5_GPU_TIMED_RANGES must be an integer from 1 to 16384");
+        return static_cast<std::uint32_t>(parsed);
+    }();
+    return limit;
+}
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -1848,7 +1859,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && DrawProfiled())) return NoTiming;
     const auto commands = open->commands;
-    const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
+    const std::uint32_t queryCount = full ? TimedRangeLimit() * 2 : 2;
     if (open->queries == VK_NULL_HANDLE) {
         if (!full && !sparePools.empty()) {
             open->queries = sparePools.back();
@@ -1862,7 +1873,8 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
                 return NoTiming;
             }
         }
-        function(cmdResetQueryPool, "vkCmdResetQueryPool")(commands, open->queries, 0, queryCount);
+        if (context.hostQueryReset) context.Function<PFN_vkResetQueryPoolEXT>("vkResetQueryPoolEXT")(context.device, open->queries, 0, queryCount);
+        else function(cmdResetQueryPool, "vkCmdResetQueryPool")(commands, open->queries, 0, queryCount);
     }
     if (open->timedKeys.size() >= queryCount / 2) {
         timingDropped.fetch_add(1, std::memory_order_relaxed);
@@ -2088,6 +2100,44 @@ void Recorder::readSamples(Batch& batch) {
     samplesPassed.fetch_add(samples, std::memory_order_acq_rel);
 }
 
+void Recorder::reportGpuProgress(const Batch& batch) const {
+    if (!GpuTimingEnabled() || batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
+    if (!context.hostQueryReset) {
+        std::fprintf(stderr, "[gpu-progress] batch %llu queue 0x%x: %zu timed ranges; query availability requires host query reset\n", static_cast<unsigned long long>(batch.serial), batch.queue, batch.timedKeys.size());
+        return;
+    }
+    struct Stamp { std::uint64_t value; std::uint64_t available; };
+    std::vector<Stamp> stamps(batch.timedKeys.size() * 2);
+    const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(Stamp), stamps.data(), sizeof(Stamp), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (result != VK_SUCCESS && result != VK_NOT_READY) {
+        std::fprintf(stderr, "[gpu-progress] batch %llu queue 0x%x: query availability failed with Vulkan result %d\n", static_cast<unsigned long long>(batch.serial), batch.queue, static_cast<int>(result));
+        return;
+    }
+    std::size_t complete = 0, pending = 0, notStarted = 0, lastComplete = batch.timedKeys.size();
+    for (std::size_t index = 0; index < batch.timedKeys.size(); ++index) {
+        if (index == batch.batchTiming) continue;
+        const auto& begin = stamps[index * 2];
+        const auto& end = stamps[index * 2 + 1];
+        if (begin.available != 0 && end.available != 0) { ++complete; lastComplete = index; }
+        else if (begin.available != 0) ++pending;
+        else ++notStarted;
+    }
+    std::fprintf(stderr, "[gpu-progress] batch %llu queue 0x%x: %zu complete, %zu started without end, %zu start stamps unavailable\n", static_cast<unsigned long long>(batch.serial), batch.queue, complete, pending, notStarted);
+    const auto printRange = [&](std::size_t index, const char* status) {
+        const auto key = batch.timedKeys[index];
+        const bool commandClass = key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count);
+        std::fprintf(stderr, "[gpu-progress] range %zu %s key=0x%llx %s\n", index, commandClass ? CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)] : "program", static_cast<unsigned long long>(key), status);
+    };
+    if (lastComplete != batch.timedKeys.size()) printRange(lastComplete, "complete");
+    std::size_t printedPending = 0, printedNotStarted = 0;
+    for (std::size_t index = 0; index < batch.timedKeys.size(); ++index) {
+        if (index == batch.batchTiming || stamps[index * 2 + 1].available != 0) continue;
+        if (stamps[index * 2].available != 0) {
+            if (printedPending++ < 8) printRange(index, "start available, end unavailable");
+        } else if (printedNotStarted++ < 2) printRange(index, "start unavailable");
+    }
+}
+
 void Recorder::readGpuTiming(Batch& batch) {
     if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
     std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
@@ -2151,7 +2201,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), TimedRangeLimit());
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
@@ -3259,6 +3309,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+            reportGpuProgress(*batch);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {

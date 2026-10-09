@@ -143,6 +143,7 @@ struct Context {
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool hostQueryReset = false;
     std::uint32_t srgbDecodeFormats = 0;
 
     template<typename TFunction>

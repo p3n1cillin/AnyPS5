@@ -206,6 +206,7 @@ struct VulkanDevice::State {
     bool depthClipControl = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool hostQueryReset = false;
     bool maintenance8 = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool depthClamp = false;
@@ -1109,6 +1110,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
         pipelineFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &pipelineFeatures;
+    }
+    VkPhysicalDeviceHostQueryResetFeaturesEXT hostQueryReset{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT};
+    if (hasExtension(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hostQueryReset};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->hostQueryReset = hostQueryReset.hostQueryReset == VK_TRUE;
+        if (state->hostQueryReset) {
+            deviceExtensions.push_back(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+            hostQueryReset.pNext = byteFeatures.pNext;
+            byteFeatures.pNext = &hostQueryReset;
+        }
     }
     bdaFeatures.pNext = &byteFeatures;
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
@@ -2538,6 +2550,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
+    context.hostQueryReset = state->hostQueryReset;
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     return context;
 }

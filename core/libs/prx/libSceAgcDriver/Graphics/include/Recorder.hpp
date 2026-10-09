@@ -617,6 +617,7 @@ private:
         bool behindCompletion = false;
     };
     void readGpuTiming(Batch& batch);
+    void reportGpuProgress(const Batch& batch) const;
     void beginSamples(Batch& batch);
     void readSamples(Batch& batch);
     bool gpuSampleCounter();

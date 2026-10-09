@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <map>
 #include <memory>
@@ -30,6 +31,12 @@ struct MockDevice {
     std::map<VkFence, bool> signaled;
     std::uint64_t submits = 0;
     std::uint64_t fenceWaits = 0;
+    int timeouts = 0;
+    bool queriesInitialized = false;
+    bool queriesComplete = false;
+    std::size_t progressReads = 0;
+    std::size_t hostResets = 0;
+    std::uint32_t queryCount = 0;
 };
 
 MockDevice mock;
@@ -56,6 +63,8 @@ VKAPI_ATTR VkResult VKAPI_CALL mockGetFenceStatus(VkDevice, VkFence fence) {
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t count, const VkFence* fences, VkBool32, std::uint64_t) {
+    if (mock.timeouts-- > 0) return VK_TIMEOUT;
+    mock.queriesComplete = true;
     for (std::uint32_t i = 0; i < count; ++i) mock.signaled.at(fences[i]) = true;
     ++mock.fenceWaits;
     return VK_SUCCESS;
@@ -89,6 +98,41 @@ VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer, VkPipelineBindPo
 VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t, const void*) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) {}
 
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateQueryPool(VkDevice, const VkQueryPoolCreateInfo* info, const VkAllocationCallbacks*, VkQueryPool* pool) {
+    *pool = reinterpret_cast<VkQueryPool>(mock.next++);
+    mock.queriesInitialized = false;
+    mock.queryCount = info->queryCount;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroyQueryPool(VkDevice, VkQueryPool, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdWriteTimestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, std::uint32_t) {}
+
+VKAPI_ATTR void VKAPI_CALL mockResetQueryPool(VkDevice, VkQueryPool, std::uint32_t, std::uint32_t) {
+    mock.queriesInitialized = true;
+    ++mock.hostResets;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockGetQueryPoolResults(VkDevice, VkQueryPool, std::uint32_t first, std::uint32_t count, std::size_t bytes, void* data, VkDeviceSize stride, VkQueryResultFlags flags) {
+    const bool availability = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != 0;
+    if (availability) {
+        ++mock.progressReads;
+        Expect(mock.queriesInitialized, "queried availability before the pool was initialized on the host");
+        Expect((flags & (VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_PARTIAL_BIT)) == 0, "GPU progress retrieval waits or requests invalid partial timestamp results");
+    } else Expect(mock.queriesComplete, "retrieved complete timings before the fence signaled");
+    Expect((flags & VK_QUERY_RESULT_64_BIT) != 0, "timestamp retrieval truncates its results");
+    Expect(bytes >= (count - 1) * stride + (availability ? 16u : 8u), "timestamp results do not fit the output buffer");
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const auto query = first + index;
+        const std::uint64_t ready = mock.queriesComplete || query == 0 || query == 2 || query == 3 || query == 4;
+        const std::uint64_t value = ready ? 100 + query : 0xffffffffffffffffull;
+        auto* output = static_cast<std::byte*>(data) + index * stride;
+        std::memcpy(output, &value, sizeof(value));
+        if (availability) std::memcpy(output + sizeof(value), &ready, sizeof(ready));
+    }
+    return mock.queriesComplete ? VK_SUCCESS : VK_NOT_READY;
+}
+
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
         {"vkAllocateCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateCommandBuffers)},
@@ -110,6 +154,11 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
+        {"vkCreateQueryPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateQueryPool)},
+        {"vkDestroyQueryPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyQueryPool)},
+        {"vkCmdWriteTimestamp", reinterpret_cast<PFN_vkVoidFunction>(mockCmdWriteTimestamp)},
+        {"vkResetQueryPoolEXT", reinterpret_cast<PFN_vkVoidFunction>(mockResetQueryPool)},
+        {"vkGetQueryPoolResults", reinterpret_cast<PFN_vkVoidFunction>(mockGetQueryPoolResults)},
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -194,10 +243,34 @@ void CountFollowsEveryPath() {
     Expect(recorder.Reap() && recorder.InFlightKeptBytes() == 0, "a reaped batch still counts " + std::to_string(recorder.InFlightKeptBytes()) + " kept bytes in flight");
 }
 
+void GpuProgress(bool hostReset) {
+    mock = MockDevice{};
+    mock.timeouts = 1;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto context = mockContext();
+    context.hostQueryReset = hostReset;
+    Recorder recorder(context);
+    Expect(Recorder::GpuTimingEnabled(), "GPU progress test requires profiling");
+    for (const auto key : {0x500600000ull, 0x50064e800ull, 0x500650000ull}) {
+        const auto range = recorder.BeginGpuTiming(key);
+        recorder.EndGpuTiming(range);
+    }
+    recorder.Sync();
+    Expect(mock.progressReads == (hostReset ? 1u : 0u), "timeout did not retrieve safe query availability exactly once");
+    Expect(mock.hostResets == (hostReset ? 1u : 0u), "query pool host initialization does not follow the enabled feature");
+    Expect(mock.queryCount == 16, "the configured eight timing ranges did not size the query pool");
+    Expect(recorder.Idle(), "progress reporting changed completion of the batch");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-progress") {
+            GpuProgress(true);
+            GpuProgress(false);
+            return failures == 0 ? 0 : 1;
+        }
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();
         SyncedWithinTwiceTheBudget();
