@@ -16,7 +16,7 @@ namespace {
 using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
 
-constexpr std::uint32_t MaxGroups = 64;
+constexpr std::uint32_t MaxGroups = 4096;
 constexpr std::uint32_t Threads = 64;
 alignas(256) std::array<std::uint32_t, MaxGroups * Threads * 2> Output{};
 alignas(4096) std::array<std::uint32_t, 4096> Texels{};
@@ -102,8 +102,12 @@ int main() {
             std::printf("skipped, subgroup size %u cannot hold a wave64 in two lanes\n", device->Target().subgroupSize);
             return VulkanTestSkipped;
         }
-        for (const auto groups : {1u, 8u, MaxGroups}) {
-            for (const auto initial : {0u, 1u, 0xfffffffeu}) Run(*device, groups, initial);
+        for (const auto groups : {1u, 8u, 64u, MaxGroups}) {
+            for (const auto initial : {0u, 1u, 3u, 0xfffffffeu}) {
+                std::printf("wave image ticket: groups=%u initial=%u\n", groups, initial);
+                std::fflush(stdout);
+                Run(*device, groups, initial);
+            }
         }
         std::puts("wave image ticket tests passed");
         return 0;
