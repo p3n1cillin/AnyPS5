@@ -1900,11 +1900,23 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.proxied) {
             binding.resident->RecordAttachmentProxyStore(commands, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             countBarrier(2);
-            continue;
-        }
-        if (binding.resident != nullptr) {
+        } else if (binding.resident != nullptr) {
             imageBarrier(context, commands, binding.resident->Image(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
             countBarrier();
+        }
+        if (binding.resident != nullptr) {
+            if (dumpLimit > 0) {
+                std::lock_guard lock(dumpMutex);
+                if (dumped[binding.color.address] < dumpLimit) {
+                    const auto bytes = static_cast<std::size_t>(binding.color.extent.width) * binding.color.extent.height * binding.color.elementBytes;
+                    binding.dump = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                    VkBufferImageCopy copy{};
+                    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, binding.color.mip, 0, 1};
+                    copy.imageOffset.z = static_cast<std::int32_t>(binding.color.depthSlice);
+                    copy.imageExtent = {binding.color.extent.width, binding.color.extent.height, 1};
+                    context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, binding.resident->Image(), VK_IMAGE_LAYOUT_GENERAL, binding.dump->Handle(), 1, &copy);
+                }
+            }
             continue;
         }
         VkBufferImageCopy copy{};
@@ -1934,6 +1946,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             context.detiler->Dispatch(commands, TextureTileMode::kR64KBX, binding.color.elementBytes, binding.linearDevice->Handle(), 0, binding.tiledDevice->Handle(), 0, binding.mip, true);
             memoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             CopyBuffer(context, commands, binding.tiledDevice->Handle(), 0, binding.tiled->Handle(), 0, binding.original.size());
+        } else if (dumpLimit > 0) {
+            std::lock_guard lock(dumpMutex);
+            if (dumped[binding.color.address] < dumpLimit) {
+                const auto bytes = static_cast<std::size_t>(binding.color.extent.width) * binding.color.extent.height * binding.color.elementBytes;
+                binding.dump = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                memoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                CopyBuffer(context, commands, binding.transfer->Handle(), 0, binding.dump->Handle(), 0, bytes);
+            }
         }
     }
     VkMemoryBarrier download{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
