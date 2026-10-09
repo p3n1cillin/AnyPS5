@@ -115,24 +115,12 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     return page;
 }
 
-constexpr std::uint64_t NullPageBytes = 0x10000;
-
 bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* value) {
     auto& self = *static_cast<ShaderMemory*>(context);
     if (address % sizeof(*value) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(*value)) {
         throw std::runtime_error("AGC driver: invalid shader memory read address");
     }
     ++CaptureTotals().reads;
-    // The flat SRT walk reads every slot, also through a pointer the program loads as null (or as
-    // stale data) and only dereferences on a path it does not take: the console faults only when a
-    // wave executes the read. Such a word reads 0 and is not captured.
-    const auto unmapped = [&] {
-        static std::atomic<std::uint32_t> reported{0};
-        if (reported.fetch_add(1, std::memory_order_relaxed) < 16u) std::fprintf(stderr, "[capture] word at 0x%llx is not mapped; the walk reads it as 0\n", static_cast<unsigned long long>(address));
-        *value = 0;
-        return true;
-    };
-    if (address < NullPageBytes) return unmapped();
     if (!self.initial.empty()) {
         const auto next = self.initial.upper_bound(address);
         if (next != self.initial.begin()) {
@@ -187,7 +175,6 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 word = waited;
             }
         } else {
-            if (!page.wordwise && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) return unmapped();
             // On a word-wise page the bytes before the hook's wait are kept for the observer.
             const bool observed = page.wordwise && policy == PendingWrite::Sync && self.observe != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
             std::uint32_t before = 0;
