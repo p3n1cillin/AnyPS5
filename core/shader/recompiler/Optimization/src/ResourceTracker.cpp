@@ -560,10 +560,11 @@ private:
         return emit ? EmitCopy(*value, arguments, position) : value;
     }
 
-    IrValue* SubstituteEdge(IrValue* value, const IrBlock* predecessor, IrValue& position, bool emit, std::uint32_t depth) {
+    IrValue* SubstituteEdge(IrValue* value, const IrBlock* predecessor, IrValue& position, bool emit, std::uint32_t depth, const IrBlock* splitBlock) {
         value = value->Resolve();
         std::vector<IrValue*> phis;
         CollectDescriptorPhis(value, phis, depth);
+        if (splitBlock != nullptr) std::erase_if(phis, [splitBlock](const IrValue* phi) { return phi->Parent() != splitBlock; });
         if (phis.empty()) {
             return value;
         }
@@ -573,7 +574,7 @@ private:
         }
         std::vector<IrValue*> arguments;
         for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
-            IrValue* argument = SubstituteEdge(value->Argument(index), predecessor, position, emit, depth - 1u);
+            IrValue* argument = SubstituteEdge(value->Argument(index), predecessor, position, emit, depth - 1u, splitBlock);
             if (argument == nullptr) {
                 return nullptr;
             }
@@ -598,20 +599,21 @@ private:
         return phi;
     }
 
-    void SplitDescriptorPhi(IrValue& inst) {
+    std::vector<IrValue*> SplitDescriptorPhi(IrValue& inst) {
         const auto info = ImageOpcodeInfoOf(inst.Opcode());
         const std::uint32_t handleCount = info.needsSampler ? 2u : 1u;
         if (inst.ArgumentCount() < handleCount || inst.Parent() == nullptr) {
-            return;
+            return {};
         }
         std::array<IrValue*, 2> handles {};
         std::array<bool, 2> split {};
+        std::array<IrBlock*, 2> handleBlocks {};
         std::vector<IrValue*> phis;
         for (std::uint32_t slot = 0; slot < handleCount; slot++) {
             IrValue* handle = inst.Argument(slot)->Resolve();
             const auto expected = slot == 0u ? IrOpcode::GetImageResource : IrOpcode::GetSamplerResource;
             if (handle->Opcode() != expected || handle->ArgumentCount() != (slot == 0u ? 8u : 4u)) {
-                return;
+                return {};
             }
             handles[slot] = handle;
             std::vector<IrValue*> handlePhis;
@@ -619,6 +621,10 @@ private:
                 CollectDescriptorPhis(handle->Argument(dword), handlePhis, phiSearchDepth);
             }
             split[slot] = !handlePhis.empty();
+            if (!handlePhis.empty()) {
+                IrBlock* block = handlePhis.front()->Parent();
+                if (block != nullptr && std::ranges::all_of(handlePhis, [block](const IrValue* phi) { return phi->Parent() == block; })) handleBlocks[slot] = block;
+            }
             for (IrValue* phi : handlePhis) {
                 if (std::ranges::find(phis, phi) == phis.end()) {
                     phis.push_back(phi);
@@ -626,29 +632,44 @@ private:
             }
         }
         if (phis.empty()) {
-            return;
+            return {};
         }
-        if (!SplitDescriptorEdges(inst, handles, split, handleCount, phis)) {
-            SplitDescriptorWeb(inst, handles, split, handleCount);
+        bool independent = handleCount == 2u && handleBlocks[0] != nullptr && handleBlocks[1] != nullptr && handleBlocks[0] != handleBlocks[1];
+        if (independent) {
+            const auto imageEdges = handleBlocks[0]->Predecessors().size();
+            const auto samplerEdges = handleBlocks[1]->Predecessors().size();
+            independent = samplerEdges != 0u && imageEdges <= 64u / samplerEdges;
         }
+        const auto copies = SplitDescriptorEdges(inst, handles, split, handleCount, phis, independent);
+        if (!copies.empty()) return independent ? copies : std::vector<IrValue*>{};
+        SplitDescriptorWeb(inst, handles, split, handleCount);
+        return {};
     }
 
-    bool SplitDescriptorEdges(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, const std::vector<IrValue*>& phis) {
+    std::vector<IrValue*> SplitDescriptorEdges(IrValue& inst, const std::array<IrValue*, 2>& handles, std::array<bool, 2> split, std::uint32_t handleCount, std::vector<IrValue*> phis, bool independent) {
         IrBlock* block = phis.front()->Parent();
         if (block == nullptr) {
-            return false;
+            return {};
+        }
+        if (independent) {
+            std::erase_if(phis, [block](const IrValue* phi) { return phi->Parent() != block; });
+            for (std::uint32_t slot = 0; slot < handleCount; slot++) {
+                std::vector<IrValue*> handlePhis;
+                for (IrValue* argument : handles[slot]->Arguments()) CollectDescriptorPhis(argument, handlePhis, phiSearchDepth);
+                split[slot] = std::ranges::any_of(handlePhis, [block](const IrValue* phi) { return phi->Parent() == block; });
+            }
         }
         const auto& predecessors = block->Predecessors();
         if (predecessors.size() < 2u) {
-            return false;
+            return {};
         }
         for (const IrValue* phi : phis) {
             if (phi->Parent() != block || phi->PhiBlockCount() != predecessors.size()) {
-                return false;
+                return {};
             }
             for (const IrBlock* predecessor : predecessors) {
                 if (PhiIncoming(*phi, predecessor) == nullptr) {
-                    return false;
+                    return {};
                 }
             }
         }
@@ -673,8 +694,8 @@ private:
         for (const IrBlock* arm : arms) {
             for (std::uint32_t slot = 0; slot < handleCount; slot++) {
                 for (std::size_t dword = 0; split[slot] && dword < handles[slot]->ArgumentCount(); dword++) {
-                    if (SubstituteEdge(handles[slot]->Argument(dword), arm, inst, false, phiSearchDepth) == nullptr) {
-                        return false;
+                    if (SubstituteEdge(handles[slot]->Argument(dword), arm, inst, false, phiSearchDepth, independent ? block : nullptr) == nullptr) {
+                        return {};
                     }
                 }
             }
@@ -688,14 +709,13 @@ private:
             }
             conditions.push_back(&EdgeSelector(*block, edges));
         }
-        ReplaceWithArmCopies(inst, handles, split, handleCount, conditions, [&](std::uint32_t arm, std::uint32_t slot, std::size_t dword) {
-            return SubstituteEdge(handles[slot]->Argument(dword), arms[arm], inst, true, phiSearchDepth);
+        return ReplaceWithArmCopies(inst, handles, split, handleCount, conditions, [&](std::uint32_t arm, std::uint32_t slot, std::size_t dword) {
+            return SubstituteEdge(handles[slot]->Argument(dword), arms[arm], inst, true, phiSearchDepth, independent ? block : nullptr);
         });
-        return true;
     }
 
     template <typename Dword>
-    void ReplaceWithArmCopies(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, std::span<IrValue* const> conditions, Dword&& dword) {
+    std::vector<IrValue*> ReplaceWithArmCopies(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, std::span<IrValue* const> conditions, Dword&& dword) {
         std::vector<IrValue*> copies;
         const auto flags = inst.Flags<MemoryFlags>();
         const auto memory = m_program.Resources().memoryInfo.at(flags.index);
@@ -741,6 +761,7 @@ private:
         inst.ReplaceAllUsesWith(result);
         inst.Invalidate();
         inst.Parent()->RemoveInstruction(&inst);
+        return copies;
     }
 
     static bool HoldsProgramCounter(IrValue* value, std::uint32_t depth) {
@@ -886,8 +907,11 @@ private:
                 }
             }
         }
-        for (IrValue* inst : candidates) {
-            SplitDescriptorPhi(*inst);
+        while (!candidates.empty()) {
+            IrValue* inst = candidates.back();
+            candidates.pop_back();
+            const auto copies = SplitDescriptorPhi(*inst);
+            candidates.insert(candidates.end(), copies.begin(), copies.end());
         }
     }
 
