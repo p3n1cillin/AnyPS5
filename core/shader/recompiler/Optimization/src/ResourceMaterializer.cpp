@@ -741,14 +741,13 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         if (mode.numericClass == decoded.numericClass && mode.dimension == decoded.dimension && mode.conversionFormat == decoded.conversionFormat && mode.packedFormat == decoded.packedFormat && mode.cube == decoded.cube && mode.depthBits == decoded.depthBits && mode.depthUnorm16 == decoded.depthUnorm16 && mode.srgbDecode == decoded.srgbDecode) return index;
     }
     if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) throw std::runtime_error("image address has too few coordinate components");
-    const auto describe = [](const auto& value) {
-        return "numeric=" + std::to_string(static_cast<int>(value.numericClass)) + " dim=" + std::to_string(static_cast<int>(value.dimension)) + " conversion=" + std::to_string(static_cast<int>(value.conversionFormat)) +
-            " packed=" + std::to_string(static_cast<int>(value.packedFormat)) + " cube=" + std::to_string(value.cube) + " depthBits=" + std::to_string(value.depthBits) + " unorm16=" + std::to_string(value.depthUnorm16) +
-            " srgb=" + std::to_string(value.srgbDecode) + "";
-    };
-    std::string detail = "descriptor {" + describe(decoded) + " emulated=" + std::to_string(emulated) + " fmask=" + std::to_string(decoded.fmask) + "} modes";
-    for (const auto& mode : modes) detail += " {" + describe(mode) + "}";
-    throw std::runtime_error("image descriptor is incompatible with the static runtime image interface: " + detail);
+    throw std::runtime_error("image descriptor is incompatible with the static runtime image interface: source=" + std::to_string(image.source) +
+        " firstUsePc=" + std::to_string(image.firstUsePc) + " instructionDim=" + std::to_string(static_cast<int>(image.dimension)) +
+        " class=" + std::to_string(static_cast<int>(image.resourceClass)) + " read=" + std::to_string(image.read) + " written=" + std::to_string(image.written) +
+        " descriptorDim=" + std::to_string(static_cast<int>(decoded.dimension)) + " numeric=" + std::to_string(static_cast<int>(decoded.numericClass)) +
+        " conversion=" + std::to_string(static_cast<int>(decoded.conversionFormat)) + " packed=" + std::to_string(static_cast<int>(decoded.packedFormat)) +
+        " cube=" + std::to_string(decoded.cube) + " depthBits=" + std::to_string(decoded.depthBits) + " unorm16=" + std::to_string(decoded.depthUnorm16) +
+        " srgb=" + std::to_string(decoded.srgbDecode) + " emulated=" + std::to_string(emulated) + " fmask=" + std::to_string(decoded.fmask));
 }
 
 std::uint32_t ResourceMaterializer::EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index) {

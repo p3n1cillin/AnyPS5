@@ -1480,6 +1480,50 @@ void verifyUnnormalizedSamplers() {
     expectFailure([&] { static_cast<void>(Recompile(pixel)); }, "unnormalized guest sampler is used by an implicit-LOD sample, which is not implemented", "unnormalized samplers: a pixel image_sample was accepted");
 }
 
+void verifyImageInterfaceDiagnostics() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 8> load{0x7e040280u, 0x7e060280u, 0xf0000f08u, 0x00010402u, 0xbf8c3f70u, 0xe07c0000u, 0x80000400u, 0xbf810000u};
+    const std::array<std::uint32_t, 9> store{0x7e040280u, 0x7e060280u, 0x7e080281u, 0x7e0a0282u, 0x7e0c0283u, 0x7e0e0284u, 0xf0200f08u, 0x00010402u, 0xbf810000u};
+    const std::array<std::uint32_t, 6> capabilities{spv::CapabilityShader, spv::CapabilitySampled1D, spv::CapabilityImage1D, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    alignas(256) static std::array<std::uint32_t, 64> output{};
+    alignas(256) static std::array<std::uint32_t, 64> texels{};
+    const auto outputBase = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const auto textureBase = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data()));
+    const auto recompile = [&](std::span<const std::uint32_t> code, std::uint32_t type, std::uint32_t format) {
+        const std::array<std::uint32_t, 12> userData{
+            static_cast<std::uint32_t>(outputBase), static_cast<std::uint32_t>((outputBase >> 32u) & 0xffffu), 256u, 0x31016facu,
+            static_cast<std::uint32_t>(textureBase >> 8u), static_cast<std::uint32_t>((textureBase >> 40u) & 0xffu) | (format << 20u), 0u, (type << 28u) | 0xfacu,
+            0u, 0u, 0u, 0u};
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x5b000u, code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.bdaAbiVersion = BdaAbi::Version;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        return Recompile(request);
+    };
+    auto lineLoad = load;
+    lineLoad[2] &= ~8u;
+    auto lineStore = store;
+    lineStore[6] &= ~8u;
+    for (const auto format : {22u, 77u}) {
+        static_cast<void>(recompile(load, 9u, format));
+        static_cast<void>(recompile(store, 9u, format));
+        static_cast<void>(recompile(lineLoad, 8u, format));
+        static_cast<void>(recompile(lineStore, 8u, format));
+        expectFailure([&] { static_cast<void>(recompile(load, 8u, format)); }, "firstUsePc=8 instructionDim=3 class=1 read=1 written=0 descriptorDim=1", "image interface diagnostics: the load did not identify its access");
+        expectFailure([&] { static_cast<void>(recompile(store, 8u, format)); }, "firstUsePc=24 instructionDim=3 class=2 read=0 written=1 descriptorDim=1", "image interface diagnostics: the store did not identify its access");
+    }
+}
+
 void verifyUnusedUnnormalizedSampler() {
     using namespace ShaderRecompiler;
     ImageResource image{};
@@ -2090,6 +2134,7 @@ int main(int argc, char** argv) {
         verifyShaderClockScopes();
         verifyInt64AtomicCapabilities();
         verifyUnnormalizedSamplers();
+        verifyImageInterfaceDiagnostics();
         verifyUnusedUnnormalizedSampler();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
