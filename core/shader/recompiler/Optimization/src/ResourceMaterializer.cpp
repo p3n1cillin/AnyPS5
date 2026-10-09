@@ -615,16 +615,6 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             volume.dimension = RdnaImageDimension::Dim3D;
             modes.push_back(volume);
         }
-        // The descriptor's type decides the image's shape: an image with fewer dimensions than the
-        // address uses the leading coordinates and ignores the rest.
-        if ((image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim3D) && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
-            for (const auto lower : {RdnaImageDimension::Dim1D, RdnaImageDimension::Dim2D}) {
-                if (lower == image.dimension) break;
-                auto narrower = mode;
-                narrower.dimension = lower;
-                modes.push_back(narrower);
-            }
-        }
         if (image.dimension == RdnaImageDimension::Dim1DArray || image.dimension == RdnaImageDimension::Dim2DArray || image.dimension == RdnaImageDimension::Dim2DMsaaArray) {
             auto plain = mode;
             plain.dimension = image.dimension == RdnaImageDimension::Dim1DArray ? RdnaImageDimension::Dim1D : image.dimension == RdnaImageDimension::Dim2DArray ? RdnaImageDimension::Dim2D : RdnaImageDimension::Dim2DMsaa;
