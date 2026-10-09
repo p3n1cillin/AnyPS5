@@ -194,6 +194,7 @@ CompiledVariant sampleVariant() {
     image.cube = true;
     image.r128 = true;
     image.fmaskCompatible = false;
+    image.lineCompatible = false;
     image.depthBitsCompatible = false;
     image.byElements = 4;
     image.byComponents = 1;

@@ -1514,7 +1514,7 @@ void verifyImageInterfaceDiagnostics() {
     lineLoad[2] &= ~8u;
     auto lineStore = store;
     lineStore[6] &= ~8u;
-    for (const auto format : {22u, 77u}) {
+    for (const auto format : {20u, 21u}) {
         static_cast<void>(recompile(load, 9u, format));
         static_cast<void>(recompile(store, 9u, format));
         static_cast<void>(recompile(lineLoad, 8u, format));

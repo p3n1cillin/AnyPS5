@@ -82,6 +82,7 @@ struct ImageResource {
     bool depthUnorm16 = false;
     bool packed = false;
     bool fmaskCompatible = true;
+    bool lineCompatible = true;
     bool depthBitsCompatible = true;
     std::uint32_t byElements = 0;
     std::uint32_t byComponents = 0;

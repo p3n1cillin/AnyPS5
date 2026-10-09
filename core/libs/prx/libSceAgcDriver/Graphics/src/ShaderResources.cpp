@@ -52,6 +52,10 @@ VkComponentSwizzle ComponentSwizzleFor(std::uint8_t dstSel) {
 
 VkComponentMapping ViewComponents(const GuestTextureResource& resource) {
     if (IsConvertedTextureFormat(resource.format)) return {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
+    if (resource.dimension == TextureDimension::k1D && resource.format == 22u &&
+        resource.dstSelX == 4u && resource.dstSelY == 5u && resource.dstSelZ == 6u && resource.dstSelW == 7u) {
+        return {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R};
+    }
     return {ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
 }
 
