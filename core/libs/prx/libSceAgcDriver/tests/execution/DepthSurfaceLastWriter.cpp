@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -74,9 +75,22 @@ public:
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
             device.queueCreateInfoCount = 1;
             device.pQueueCreateInfos = &queue;
+            VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            features.pNext = &robustness;
+            function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+            Require(robustness.nullDescriptor == VK_TRUE, "the test device does not support null descriptors");
+            robustness.robustBufferAccess2 = VK_FALSE;
+            robustness.robustImageAccess2 = VK_FALSE;
+            const char* extension = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
+            device.enabledExtensionCount = 1;
+            device.ppEnabledExtensionNames = &extension;
+            device.pNext = &robustness;
             Check(function<PFN_vkCreateDevice>("vkCreateDevice")(context.physical, &device, nullptr, &context.device), "vkCreateDevice");
+            context.nullDescriptors = true;
             context.deviceProc = function<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+            context.imageFormatProperties = function<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
             function<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(context.physical, &context.memory);
             VkPhysicalDeviceProperties properties{};
             function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(context.physical, &properties);
@@ -209,6 +223,54 @@ void StorageRoundTrip(const Context& context, std::uint64_t address) {
     Require(DepthSurfaceAt(address), "a genuine depth storage write retired the depth surface");
 }
 
+void ColorStorageWriter(const Context& context, std::uint64_t address) {
+    TextureDetiler detiler(context);
+    auto configured = context;
+    configured.detiler = &detiler;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageWritten.resize(1, true);
+    binding.guestDescriptor = {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (36u << 20u) | (((Extent.width - 1u) & 3u) << 30u),
+        ((Extent.width - 1u) >> 2u) | ((Extent.height - 1u) << 14u),
+        0x90000facu, 0, 0, 0, 0,
+    };
+    program.bindings.push_back(std::move(binding));
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    try {
+        program.bindings[0].guestDescriptor[1] = (program.bindings[0].guestDescriptor[1] & ~(0x1ffu << 20u)) | (Format32Float << 20u);
+        {
+            ShaderResources resources(configured, shader);
+            Require(DepthSurfaceAt(address), "binding a genuine depth storage writer retired the depth surface");
+        }
+        program.bindings[0].guestDescriptor[1] = (program.bindings[0].guestDescriptor[1] & ~(0x1ffu << 20u)) | (36u << 20u);
+        program.bindings[0].imageWritten[0] = false;
+        bool refused = false;
+        try {
+            ShaderResources resources(configured, shader);
+        } catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("storage image access to depth surface") != std::string::npos;
+        }
+        Require(refused && DepthSurfaceAt(address), "an incompatible read-only storage view silently retired the live depth surface");
+        program.bindings[0].imageWritten[0] = true;
+        ShaderResources resources(configured, shader);
+        Require(!DepthSurfaceAt(address), "a color storage writer at the depth plane's own address left the depth surface live");
+        DepthSurfaceView(context, Depth(address));
+        Require(resources.Revalidate(shader), "a color storage writer could not revalidate after a depth rebind");
+        Require(!DepthSurfaceAt(address), "revalidating a color storage writer left the rebound depth surface live");
+    } catch (...) {
+        ClearCachedTextures(context.device);
+        throw;
+    }
+    ClearCachedTextures(context.device);
+}
+
 void Run(const Context& context) {
     const auto wide = View(2 * Extent.width, Extent.height);
     const auto exact = View(Extent.width, Extent.height);
@@ -283,6 +345,7 @@ void Run(const Context& context) {
         mutation.Add(const_cast<std::uint8_t*>(memory), 2 * Block, true, true);
     }
     StorageRoundTrip(context, watched + Block);
+    ColorStorageWriter(context, watched + Block);
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(const_cast<std::uint8_t*>(memory));

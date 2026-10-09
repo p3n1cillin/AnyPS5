@@ -123,11 +123,16 @@ public:
     const StorageTexture* seeded = nullptr;
     std::uint32_t writerLayer = 0;
 
+    bool StorageFormatAccepts(VkFormat format) const {
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        return d16 ? (format == VK_FORMAT_R16_UINT || format == VK_FORMAT_R16_UNORM || format == VK_FORMAT_R16_SINT || format == VK_FORMAT_R16_SNORM || format == VK_FORMAT_R16_SFLOAT) : (format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT);
+    }
+
     void Transfer(StorageTexture& storage, bool into, std::uint32_t layer) {
         const auto& descriptor = storage.Descriptor();
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto storageFormat = storage.StorageFormat();
-        const bool sized = d16 ? (storageFormat == VK_FORMAT_R16_UINT || storageFormat == VK_FORMAT_R16_UNORM || storageFormat == VK_FORMAT_R16_SINT || storageFormat == VK_FORMAT_R16_SNORM || storageFormat == VK_FORMAT_R16_SFLOAT) : (storageFormat == VK_FORMAT_R32_SFLOAT || storageFormat == VK_FORMAT_R32_UINT || storageFormat == VK_FORMAT_R32_SINT);
+        const bool sized = StorageFormatAccepts(storageFormat);
         if (!sized || descriptor.width != target.extent.width || descriptor.height != target.extent.height || descriptor.mipCount != 1 || (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k2DArray) || (layer != 0 && layer > descriptor.depthOrLastArray)) {
             char text[256];
             std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), descriptor.width, descriptor.height, static_cast<int>(storageFormat), static_cast<int>(descriptor.dimension), descriptor.mipCount);
@@ -566,6 +571,16 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
 bool DepthSurfaceAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return !surface->retired && (surface->target.address == address || surface->target.stencilAddress == address); });
+}
+
+bool DepthStoragePlaneAt(VkDevice device, const GuestTextureResource& resource) {
+    const auto format = ResolveTextureFormat(resource.format);
+    std::lock_guard lock(surfacesMutex());
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) {
+        if (surface->retired || surface->context.device != device) return false;
+        if (surface->target.address == resource.baseAddress) return surface->StorageFormatAccepts(format);
+        return surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress && (format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_SINT || format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_SNORM);
+    });
 }
 
 bool DepthStencilPlaneAt(std::uint64_t address) {

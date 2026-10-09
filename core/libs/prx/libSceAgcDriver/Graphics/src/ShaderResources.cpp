@@ -1838,7 +1838,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else {
                             const auto resource = DecodeTextureResource(words);
-                            if (storageWritten[storageIndex] && !DepthSurfaceAt(resource.baseAddress)) RetireDepthSurfaces(context.device, resource.baseAddress, storageTextures[storageIndex]->GuestBytes());
+                            if (storageWritten[storageIndex] && !DepthStoragePlaneAt(context.device, resource)) RetireDepthSurfaces(context.device, resource.baseAddress, storageTextures[storageIndex]->GuestBytes());
                             expected = cachedStorageTexture(context, words, resource, storageMips[storageIndex]);
                         }
                         if (expected != storageTextures[storageIndex]) return false;
@@ -1968,6 +1968,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
             return finish(fast, false);
         }
+    }
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        const auto& image = storageTextures[index];
+        if (storageWritten[index] && !DepthStoragePlaneAt(context.device, image->Descriptor())) RetireDepthSurfaces(context.device, image->Descriptor().baseAddress, image->GuestBytes());
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     return finish(fast, true);
@@ -2764,7 +2768,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
         const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
-        if (written && !DepthSurfaceAt(resource.baseAddress)) RetireDepthSurfaces(context.device, resource.baseAddress, guestBytes);
+        if (written && !DepthStoragePlaneAt(context.device, resource)) RetireDepthSurfaces(context.device, resource.baseAddress, guestBytes);
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));
