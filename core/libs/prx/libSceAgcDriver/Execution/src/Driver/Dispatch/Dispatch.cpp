@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DispatchCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
@@ -251,6 +252,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             groups[axis] = (groups[axis] + threads - 1) / threads;
         }
     }
+    static DispatchCapture dispatchCapture(DispatchCapture::ReadOptions());
+    request.context.memory = captured;
+    static_cast<void>(dispatchCapture.Write(request, compiled,
+        {submission.queue, groups, indirectArguments, key, cached, dataHit}));
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
     if (traceIo) {
 
