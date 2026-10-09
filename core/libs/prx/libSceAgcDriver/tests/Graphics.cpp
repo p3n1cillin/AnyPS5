@@ -1114,6 +1114,21 @@ void cmaskTests() {
     Require(texels(0x5a5a5a5au), "a refused pass changed the texels of a DCC target");
 }
 
+void uint16ExportTests() {
+    auto queue = makeState();
+    queue.context[0x1c5] = 7;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 7");
+    queue.context[0x31c] = (queue.context[0x31c] & ~0x77cu) | 0x404u;
+    const auto state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.hasColorTarget && state.color.format == VK_FORMAT_R8_UINT && state.color.uintExport, "a UINT16_ABGR export into an unsigned integer target did not decode");
+    Require(!AgcDriver::Graphics::DecodeState(makeState()).color.uintExport, "a float export was marked unsigned integer");
+    auto blended = queue;
+    blended.context[0x1e0] = 1u << 30u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(blended); }, "blending into an unsigned integer target");
+    queue.context[0x1c5] = 8;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 8");
+}
+
 void DepthClipTests() {
     auto queue = makeState();
     const auto direct = AgcDriver::Graphics::DecodeState(queue);
@@ -1879,6 +1894,7 @@ struct ModuleShape {
     bool layer = false;
     bool fragDepth = false;
     std::uint32_t sampleMaskLength = 0;
+    std::uint32_t floatControlsWidth = 0;
 };
 
 void emit(std::vector<std::uint32_t>& out, spv::Op op, std::initializer_list<std::uint32_t> operands) {
@@ -2065,6 +2081,9 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     if (shape.fragmentMode) emit(words, spv::OpExecutionMode, {main, *shape.fragmentMode});
     if (shape.fragment) emit(words, spv::OpExecutionMode, {main, spv::ExecutionModeOriginUpperLeft});
     if (shape.fragDepth) emit(words, spv::OpExecutionMode, {main, spv::ExecutionModeDepthReplacing});
+    if (shape.floatControlsWidth != 0) {
+        for (const auto mode : {spv::ExecutionModeRoundingModeRTE, spv::ExecutionModeDenormPreserve, spv::ExecutionModeSignedZeroInfNanPreserve}) emit(words, spv::OpExecutionMode, {main, mode, shape.floatControlsWidth});
+    }
     words.insert(words.end(), annotations.begin(), annotations.end());
     words.insert(words.end(), declarations.begin(), declarations.end());
     words.insert(words.end(), function.begin(), function.end());
@@ -2452,6 +2471,23 @@ void ConservativeRasterizationTests() {
     }
 }
 
+void floatControlsModeTests() {
+    AgcDriver::Graphics::State state{};
+    state.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult pixel;
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
+    const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    for (const auto width : {16u, 32u, 64u}) {
+        vertex.spirv = makeModule({.floatControlsWidth = width});
+        pixel.spirv = makeModule({.fragment = true, .floatControlsWidth = width});
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false);
+    }
+    vertex.spirv = makeModule({.floatControlsWidth = 8u});
+    pixel.spirv = makeModule({.fragment = true});
+    expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "float controls execution modes");
+}
+
 void pixelParameterSlotTests() {
     using AgcDriver::Graphics::CompiledShader;
     const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
@@ -2599,6 +2635,15 @@ void validationTests() {
         const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability");
         AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, true);
+    }
+    {
+        ShaderRecompiler::RecompileResult vertex;
+        vertex.spirv = makeModule({});
+        vertex.spirv.insert(vertex.spirv.begin() + 5, {(2u << 16u) | spv::OpCapability, static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)});
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+        const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability 12");
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, true);
     }
     for (const auto capability : {spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle}) {
         ShaderRecompiler::RecompileResult vertex;
@@ -2868,6 +2913,7 @@ int main() {
         ReversedComponentOrderTests();
         metadataPassTests();
         cmaskTests();
+        uint16ExportTests();
         ShaderStageTests();
         TuningFieldTests();
         PixelInputLayoutTests();
@@ -2887,6 +2933,7 @@ int main() {
         vertexCopyTests();
         pixelParameterSlotTests();
         rectListTests();
+        floatControlsModeTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;

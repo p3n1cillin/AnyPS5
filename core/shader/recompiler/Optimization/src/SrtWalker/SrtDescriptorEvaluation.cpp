@@ -134,11 +134,6 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     std::vector<SrtReadPoison> poisoned;
     if (evaluateFlat) {
         flattened.resize(program.srtReads.size());
-        InaccessibleRead inaccessible;
-        if (poison != nullptr) {
-            evaluator.ReportInaccessibleReads(&inaccessible);
-            cleanEvaluator.ReportInaccessibleReads(&inaccessible);
-        }
         for (const auto& read : program.srtReads) {
             const bool clean = read.flatOffset < cleanFlatSlots.size() && cleanFlatSlots[read.flatOffset] != 0u;
             auto& selected = clean ? cleanEvaluator : evaluator;
