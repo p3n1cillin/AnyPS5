@@ -610,6 +610,12 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         mode.shaderSwizzle = ShaderImageIdentitySwizzle;
         if (conversion == IrBufferFormat::Format11_11_10UNorm || conversion == IrBufferFormat::Format10_11_11Float) mode.shaderSwizzle = 0x2acu;
         modes.push_back(mode);
+        if (image.lineCompatible && image.dimension == RdnaImageDimension::Dim2D && image.indirectRoot == ImageResource::NoIndirectImage &&
+            !image.atomic && !image.depthCompare && numeric == IrTextureNumericClass::Float && conversion == IrBufferFormat::Invalid && packed == IrBufferFormat::Invalid && !depth) {
+            auto line = mode;
+            line.dimension = RdnaImageDimension::Dim1D;
+            modes.push_back(line);
+        }
         if (image.dimension == RdnaImageDimension::Dim2D && image.fmaskCompatible && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
             auto volume = mode;
             volume.dimension = RdnaImageDimension::Dim3D;
@@ -714,7 +720,12 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         }
     }
     if (decoded.mipCount > (image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageHeapCapacity : 1u)) throw std::runtime_error("runtime storage image mip capacity exceeded");
+    const bool unmeasuredLine = image.dimension == RdnaImageDimension::Dim2D && decoded.dimension == RdnaImageDimension::Dim1D &&
+        (!image.lineCompatible || rawImageType(descriptor) != ImageType::Color1D ||
+        (format != IrBufferFormat::Format32Float && format != IrBufferFormat::Format32_32_32_32Float) || descriptorImageSwizzle(descriptor) != ShaderImageIdentitySwizzle ||
+        ((descriptor.dwords[3] >> 12u) & 0xffu) != 0u || ((descriptor.dwords[2] >> 14u) & 0x3fffu) != 0u || descriptor.dwords[4] != 0u || ((descriptor.dwords[5] >> 4u) & 0xfu) != 0u);
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
+        if (unmeasuredLine) continue;
         const auto& mode = modes[index];
         if (((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u) != emulated) continue;
         if (decoded.fmask) {
