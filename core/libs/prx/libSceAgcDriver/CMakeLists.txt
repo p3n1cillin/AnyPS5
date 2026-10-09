@@ -76,6 +76,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DispatchCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
@@ -277,6 +278,23 @@ if(BUILD_TESTING)
     set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_write_tracking PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_dispatch_capture_tests EXCLUDE_FROM_ALL
+        tests/DispatchCapture.cpp
+        Execution/src/DispatchCapture.cpp
+)
+target_include_directories(agc_dispatch_capture_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_dispatch_capture_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_dispatch_capture_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_dispatch_capture_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_dispatch_capture_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_dispatch_capture COMMAND agc_dispatch_capture_tests)
+    if(WIN32)
+        set_tests_properties(agc_dispatch_capture PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -612,6 +630,7 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
 endforeach()
 
 target_include_directories(agc_driver_prepared_exports_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+target_include_directories(agc_driver_captured_dispatch_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_include_directories(agc_driver_prepared_publication_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
