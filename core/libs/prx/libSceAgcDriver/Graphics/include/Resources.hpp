@@ -37,6 +37,7 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
+    std::uint32_t heapIndex = 0;
     std::shared_ptr<BufferPool> cache;
 };
 
@@ -62,6 +63,7 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
+    std::uint32_t heapIndex = 0;
 };
 
 // Records a whole-range buffer copy.

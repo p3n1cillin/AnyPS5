@@ -164,7 +164,7 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     for (const auto& gone : evicted) destroy(gone);
 }
 
-VkDeviceSize BufferPool::ReleaseUnusedHostMemory() {
+VkDeviceSize BufferPool::ReleaseUnusedHostMemory(std::uint32_t heapIndex) {
     std::vector<BufferAllocation> released;
     VkDeviceSize bytes = 0;
     {
@@ -174,6 +174,7 @@ VkDeviceSize BufferPool::ReleaseUnusedHostMemory() {
             for (const auto& [key, slots] : tier->free) {
                 if ((key.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) continue;
                 for (const auto& slot : slots) {
+                    if (slot.allocation.heapIndex != heapIndex) continue;
                     released.push_back(slot.allocation);
                     bytes += slot.allocation.allocationBytes;
                 }
@@ -185,10 +186,19 @@ VkDeviceSize BufferPool::ReleaseUnusedHostMemory() {
                     ++entry;
                     continue;
                 }
-                for (const auto& slot : entry->second) tier->retainedBytes -= slot.allocation.allocationBytes;
-                tier->slots -= entry->second.size();
-                tier->evictions += entry->second.size();
-                entry = tier->free.erase(entry);
+                auto& slots = entry->second;
+                for (auto slot = slots.begin(); slot != slots.end();) {
+                    if (slot->allocation.heapIndex != heapIndex) {
+                        ++slot;
+                        continue;
+                    }
+                    tier->retainedBytes -= slot->allocation.allocationBytes;
+                    --tier->slots;
+                    ++tier->evictions;
+                    slot = slots.erase(slot);
+                }
+                if (slots.empty()) entry = tier->free.erase(entry);
+                else ++entry;
             }
         }
     }

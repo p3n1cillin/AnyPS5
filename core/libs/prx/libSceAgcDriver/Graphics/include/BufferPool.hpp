@@ -22,6 +22,7 @@ struct BufferAllocation {
     std::size_t bytes;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    std::uint32_t heapIndex = 0;
 };
 
 // Released buffer allocations kept for reuse, since creating, binding and mapping one costs tens of
@@ -55,7 +56,7 @@ public:
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
-    VkDeviceSize ReleaseUnusedHostMemory();
+    VkDeviceSize ReleaseUnusedHostMemory(std::uint32_t heapIndex);
 
 private:
     struct Slot {
