@@ -28,6 +28,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -3033,6 +3034,12 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
+            static const bool traceDepthCopy = std::getenv("APS5_TRACE_DEPTH_COPY") != nullptr;
+            if (traceDepthCopy && texture->RefreshedPerUse()) {
+                using DepthBindingShape = std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, bool>;
+                static thread_local std::set<DepthBindingShape> tracedDepthBindings;
+                if (tracedDepthBindings.size() < 256u && tracedDepthBindings.emplace(resource.baseAddress, resource.width, resource.height, resource.depthOrLastArray, firstLayer).second) std::fprintf(stderr, "[depth-plane-binding] address=0x%llx extent=%ux%u last-array=%u first-layer-only=%u\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.depthOrLastArray, firstLayer ? 1u : 0u);
+            }
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
                 const auto range = texture->SampledViewRange(firstLayer);
                 const bool singleLevel = range.levels == 1u && range.layers == 1u && resource.baseLevel == 0u && EffectiveMinLod(resource) == 0.0f;
