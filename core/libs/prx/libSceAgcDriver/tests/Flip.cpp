@@ -232,6 +232,36 @@ void testFlipHold() {
     label.store(1, std::memory_order_release);
     AgcDriverWaitIdle_nid_postfix();
     check(output->state->ready == 4, "flips behind a title-stored label were lost");
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->gate = true;
+        output->state->waiting = false;
+    }
+    alignas(4) static std::atomic<std::uint32_t> later = 0;
+    struct LaterRelease {
+        ~LaterRelease() { later.store(1, std::memory_order_release); }
+    } laterRelease;
+    const auto laterAddress = reinterpret_cast<std::uintptr_t>(&later);
+    std::array<std::uint32_t, 17> gatedWait{0xc0021018, 7, 0, 0, 0xc0053c00, 0x13, static_cast<std::uint32_t>(laterAddress), static_cast<std::uint32_t>(static_cast<std::uint64_t>(laterAddress) >> 32u), 1, 0xffffffffu, 0x19, 0xc004105c, 7, 0xfffffffeu, 1, 0, 0};
+    Packet gatedWaitFrame{gatedWait.data(), static_cast<std::uint32_t>(gatedWait.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&gatedWaitFrame) == 0, "gated waiting flip submission failed");
+    {
+        std::unique_lock lock(output->state->mutex);
+        check(output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->waiting; }), "worker did not reach the second rendering wait");
+    }
+    auto progressed = std::async(std::launch::async, [] { submitFlip(); });
+    check(progressed.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout, "a flip was accepted while the worker was held before a label wait");
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->gate = false;
+    }
+    output->state->changed.notify_all();
+    check(progressed.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "a flip stayed held after the worker went on to wait for a label only the title stores");
+    progressed.get();
+    check(output->state->ready == 4, "a flip passed an unsatisfied wait after the rendering wait");
+    later.store(1, std::memory_order_release);
+    AgcDriverWaitIdle_nid_postfix();
+    check(output->state->ready == 6, "flips behind a later title-stored label were lost");
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 

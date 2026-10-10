@@ -131,29 +131,32 @@ void Driver::waitForFlipRoom(const Submission& submission) {
     }
 }
 
-bool Driver::flipHoldOver() const {
-    if (flipsAhead.load(std::memory_order_acquire) == 0) return true;
-    const auto awaited = queue0Awaited.load(std::memory_order_acquire);
-    return awaited != 0 && runningWorkers.load(std::memory_order_acquire) == 0 && orderHolders.load(std::memory_order_acquire) == 0 && !completionsPending() && !Graphics::Recorder::SnapshotWriteOverlaps(awaited, 4);
+bool Driver::awaitsTitle(std::uint64_t awaited) const {
+    return runningWorkers.load(std::memory_order_acquire) == 0 && orderHolders.load(std::memory_order_acquire) == 0 && !completionsPending() && !Graphics::Recorder::SnapshotWriteOverlaps(awaited, 4);
+}
+
+void Driver::noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited) {
+    if (queue != 0 || flipHolders.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire) || !awaitsTitle(awaited)) return;
+    std::lock_guard lock(mutex);
+    queue0AwaitsTitle.store(true, std::memory_order_release);
+    changed.notify_all();
 }
 
 void Driver::holdFlipBehindWorker(const Submission& submission) {
-    static const bool disabled = std::getenv("APS5_NO_FLIP_HOLD") != nullptr;
-    if (disabled || submission.queue != 0 || onWorkerThread()) return;
+    if (submission.queue != 0 || onWorkerThread()) return;
     bool flips = false;
     for (std::size_t cursor = 0; cursor < submission.commands.size() && !flips; cursor += Pm4::PacketWords(submission.commands[cursor])) flips = submission.commands[cursor] == FlipPacketHeader;
     if (!flips) return;
     std::unique_lock lock(mutex);
     flipHolders.fetch_add(1, std::memory_order_acq_rel);
-    while (failure == nullptr && !stopping.load(std::memory_order_acquire) && !shutdownToken.stop_requested() && !flipHoldOver()) changed.wait_for(lock, std::chrono::milliseconds(1));
+    changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
     flipHolders.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void Driver::releaseFlipHold() {
-    flipsAhead.fetch_sub(1, std::memory_order_acq_rel);
-    if (flipHolders.load(std::memory_order_acquire) == 0) return;
     std::lock_guard lock(mutex);
-    changed.notify_all();
+    flipsAhead.fetch_sub(1, std::memory_order_acq_rel);
+    if (flipHolders.load(std::memory_order_acquire) != 0) changed.notify_all();
 }
 
 void Driver::reserveOutputs(Submission& submission) {
@@ -192,6 +195,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
         while ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
             CheckFailure();
             checkStopping();
+            noteAwaitingTitle(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
             PollSleep();
         }
     }
@@ -329,6 +333,7 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
     if (blocked) runningWorkers.fetch_sub(1, std::memory_order_acq_rel);
     else runningWorkers.fetch_add(1, std::memory_order_acq_rel);
     if (queue == 0) queue0Awaited.store(blocked ? awaited : 0, std::memory_order_release);
+    if (queue == 0 && !blocked) queue0AwaitsTitle.store(false, std::memory_order_release);
     if (blocked && orderHolders.load(std::memory_order_acquire) != 0) {
         std::lock_guard lock(mutex);
         changed.notify_all();
