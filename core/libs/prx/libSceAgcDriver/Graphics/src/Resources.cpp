@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <exception>
+#include <cstdio>
 #include <sstream>
 
 namespace AgcDriver::Graphics {
@@ -48,7 +49,17 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
         }
-        const auto allocationResult = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+        const auto allocateMemory = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+        auto allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
+        VkDeviceSize releasedHostBytes = 0;
+        if ((allocationResult == VK_ERROR_OUT_OF_HOST_MEMORY || allocationResult == VK_ERROR_OUT_OF_DEVICE_MEMORY) && (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            releasedHostBytes = cache->ReleaseUnusedHostMemory();
+            if (releasedHostBytes != 0) {
+                memory = VK_NULL_HANDLE;
+                allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
+                std::fprintf(stderr, "[buffer-memory] bytes=%llu released-unused-host=%llu retry-result=%d\n", static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(releasedHostBytes), static_cast<int>(allocationResult));
+            }
+        }
         if (allocationResult != VK_SUCCESS) {
             const auto& memoryType = context.memory.memoryTypes[allocation.memoryTypeIndex];
             const auto heap = memoryType.heapIndex;
@@ -62,7 +73,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             } else {
                 operation << " heap-budget=unavailable heap-usage=unavailable";
             }
-            operation << ')';
+            operation << " released-unused-host=" << releasedHostBytes << ')';
             Check(allocationResult, operation.str().c_str());
         }
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");

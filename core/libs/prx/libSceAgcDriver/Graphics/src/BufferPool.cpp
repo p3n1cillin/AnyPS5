@@ -154,6 +154,38 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     for (const auto& gone : evicted) destroy(gone);
 }
 
+VkDeviceSize BufferPool::ReleaseUnusedHostMemory() {
+    std::vector<BufferAllocation> released;
+    VkDeviceSize bytes = 0;
+    {
+        std::lock_guard lock(mutex);
+        released.reserve(smallTier.slots + largeTier.slots + deviceTier.slots);
+        for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
+            for (const auto& [key, slots] : tier->free) {
+                if ((key.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) continue;
+                for (const auto& slot : slots) {
+                    released.push_back(slot.allocation);
+                    bytes += slot.allocation.allocationBytes;
+                }
+            }
+        }
+        for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
+            for (auto entry = tier->free.begin(); entry != tier->free.end();) {
+                if ((entry->first.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+                    ++entry;
+                    continue;
+                }
+                for (const auto& slot : entry->second) tier->retainedBytes -= slot.allocation.allocationBytes;
+                tier->slots -= entry->second.size();
+                tier->evictions += entry->second.size();
+                entry = tier->free.erase(entry);
+            }
+        }
+    }
+    for (const auto& allocation : released) destroy(allocation);
+    return bytes;
+}
+
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context) {
     if (!context.bufferPool) context.bufferPool = std::make_shared<BufferPool>(context);
     return context.bufferPool;

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -34,6 +35,10 @@ struct MockDevice {
     VkDeviceSize liveBytes = 0;
     std::map<VkDeviceMemory, VkDeviceSize> memoryBytes;
     VkResult allocationResult = VK_SUCCESS;
+    std::uint64_t allocationAttempts = 0;
+    VkDeviceSize liveHostBytes = 0;
+    VkDeviceSize maxHostBytes = std::numeric_limits<VkDeviceSize>::max();
+    VkResult budgetFailure = VK_ERROR_OUT_OF_DEVICE_MEMORY;
 };
 
 MockDevice mock;
@@ -50,9 +55,14 @@ VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer bu
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
+    ++mock.allocationAttempts;
     if (mock.allocationResult != VK_SUCCESS) return mock.allocationResult;
+    if (info->memoryTypeIndex == 1 && mock.liveHostBytes + info->allocationSize > mock.maxHostBytes) return mock.budgetFailure;
     *memory = reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(mock.next++));
-    if (info->memoryTypeIndex == 1) mock.hostMemory[*memory].resize(info->allocationSize);
+    if (info->memoryTypeIndex == 1) {
+        mock.hostMemory[*memory].resize(info->allocationSize);
+        mock.liveHostBytes += info->allocationSize;
+    }
     mock.memoryBytes[*memory] = info->allocationSize;
     mock.liveBytes += info->allocationSize;
     ++mock.allocations;
@@ -75,6 +85,7 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyBuffer(VkDevice, VkBuffer, const VkAllocat
 }
 
 VKAPI_ATTR void VKAPI_CALL mockFreeMemory(VkDevice, VkDeviceMemory memory, const VkAllocationCallbacks*) {
+    if (mock.hostMemory.contains(memory)) mock.liveHostBytes -= mock.memoryBytes.at(memory);
     mock.liveBytes -= mock.memoryBytes.at(memory);
     mock.memoryBytes.erase(memory);
     mock.hostMemory.erase(memory);
@@ -274,6 +285,53 @@ void AllocationFailure() {
             Expect(message.find(budget) != std::string::npos, "an allocation failure misreported the heap budget");
         }
         Expect(rejected && mock.destroyedBuffers == 1 && mock.allocations == 0 && mock.frees == 0, "an allocation failure leaked its buffer or freed memory that was never allocated");
+        Expect(mock.allocationAttempts == 1, "an allocation failure retried without releasing any unused memory");
+    }
+}
+
+void AllocationPressure() {
+    for (const auto failure : {VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY}) {
+        mock = MockDevice{};
+        mock.maxHostBytes = 16 * MiB;
+        mock.budgetFailure = failure;
+        auto context = mockContext();
+        Buffer live(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        live.Bytes().front() = std::byte{0x42};
+        {
+            Buffer unused(context, 8 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        }
+        VkBuffer deviceHandle = VK_NULL_HANDLE;
+        {
+            DeviceBuffer unused(context, 20 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            deviceHandle = unused.Handle();
+        }
+        const auto attempts = mock.allocationAttempts;
+        Buffer recovered(context, 9 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Expect(mock.allocationAttempts == attempts + 2 && mock.frees == 1 && mock.liveHostBytes == 13 * MiB, "host allocation pressure did not reclaim unused memory and retry exactly once");
+        Expect(live.Bytes().front() == std::byte{0x42} && recovered.Bytes().size() == 9 * MiB, "pressure recovery altered a live buffer or the requested allocation size");
+        DeviceBuffer device(context, 20 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Expect(device.Handle() == deviceHandle, "host allocation pressure discarded a retained device-only buffer");
+    }
+}
+
+void PersistentAllocationFailure() {
+    for (const auto failure : {VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_DEVICE_LOST}) {
+        mock = MockDevice{};
+        auto context = mockContext();
+        {
+            Buffer unused(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        }
+        mock.allocationResult = failure;
+        const auto attempts = mock.allocationAttempts;
+        bool rejected = false;
+        try {
+            Buffer buffer(context, 20, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        } catch (const std::runtime_error& error) {
+            rejected = true;
+            Expect(std::string(error.what()).find("Vulkan result " + std::to_string(failure)) != std::string::npos, "pressure recovery masked a persistent Vulkan failure");
+        }
+        const bool pressure = failure == VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        Expect(rejected && mock.allocationAttempts == attempts + (pressure ? 2 : 1) && mock.frees == (pressure ? 1 : 0), "persistent exhaustion retried more than once or a non-memory failure reclaimed host buffers");
     }
 }
 
@@ -288,6 +346,8 @@ int main() {
         AddressAndHostUnchanged();
         SmallDeviceClasses();
         AllocationFailure();
+        AllocationPressure();
+        PersistentAllocationFailure();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
