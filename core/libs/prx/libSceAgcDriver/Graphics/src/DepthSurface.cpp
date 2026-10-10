@@ -298,6 +298,7 @@ public:
     DepthPlaneCopy& operator=(const DepthPlaneCopy&) = delete;
 
     std::shared_ptr<Texture> Refresh(const Context& uploadContext, std::span<const VkImage> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
+        PerformanceTimer timing("DepthPlaneCopy.Refresh");
         Require(uploadContext.device == context.device, "depth plane upload belongs to another device");
         Require(slices.size() == layers, "depth plane copy slices do not match its layers");
         const auto geometry = DescribeSurface(resource);
@@ -309,6 +310,15 @@ public:
             GuestMemory::ReadCommitted(resource.baseAddress + geometry.GuestLayerOffset(layer), upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
             uploads.push_back(std::move(upload));
         }
+        const auto uploadedBytes = geometry.layerBytes * uploads.size();
+        timing.Mark("guest_upload", uploadedBytes);
+        static const bool trace = std::getenv("APS5_TRACE_DEPTH_COPY") != nullptr;
+        static std::atomic<std::uint32_t> tracedShapes{0};
+        if (trace && (!tracedShape || tracedUploads != uploads.size())) {
+            tracedShape = true;
+            tracedUploads = uploads.size();
+            if (tracedShapes.fetch_add(1, std::memory_order_relaxed) < 256u) std::fprintf(stderr, "[depth-plane-copy] address=0x%llx extent=%ux%u layers=%u guest-layers=%zu guest-layer-bytes=%llu upload-bytes=%llu linear-bytes=%llu\n", static_cast<unsigned long long>(resource.baseAddress), extent.width, extent.height, layers, uploads.size(), static_cast<unsigned long long>(geometry.layerBytes), static_cast<unsigned long long>(uploadedBytes), static_cast<unsigned long long>(sliceBytes() * layers));
+        }
         if (!uploads.empty()) {
             Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
             context.detiler->BeginBatch();
@@ -317,9 +327,11 @@ public:
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        const auto gpuTiming = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::StagingIn) : Recorder::NoTiming;
         const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         std::vector<VkBufferImageCopy> regions(layers);
+        timing.Mark("command_setup");
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             auto& region = regions[layer];
             region.bufferOffset = sliceBytes() * layer;
@@ -328,6 +340,7 @@ public:
             if (slices[layer] != VK_NULL_HANDLE) context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slices[layer], VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &region);
             region.imageSubresource = {aspect(), 0, layer, 1};
         }
+        timing.Mark("resident_copy_record", sliceBytes() * (layers - uploads.size()));
         if (!uploads.empty()) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             std::size_t next = 0;
@@ -339,6 +352,7 @@ public:
                 for (auto& upload : uploads) recorder->Keep(upload, upload->Bytes().size());
             }
         }
+        timing.Mark("guest_detile_record", uploadedBytes);
         VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
         toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -358,8 +372,11 @@ public:
         toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         barrier(copyCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+        if (recorder != nullptr) recorder->EndGpuTiming(gpuTiming, sliceBytes() * layers);
+        timing.Mark("array_copy_record", sliceBytes() * layers);
         if (batch) batch->SubmitAndWait();
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
+        timing.Mark("submit_wait");
         const std::array<std::uint32_t, 5> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType)};
         auto& texture = textures[key];
         if (texture == nullptr) {
@@ -379,6 +396,8 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::unique_ptr<DeviceBuffer> staging;
     std::map<std::array<std::uint32_t, 5>, std::shared_ptr<Texture>> textures;
+    bool tracedShape = false;
+    std::size_t tracedUploads = 0;
 
     VkDeviceSize sliceBytes() const {
         return static_cast<VkDeviceSize>(extent.width) * extent.height * (format == VK_FORMAT_D32_SFLOAT ? 4u : 2u);
