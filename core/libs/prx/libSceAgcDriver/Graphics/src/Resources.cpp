@@ -53,16 +53,9 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         const auto allocateMemory = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
         auto allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
         VkDeviceSize releasedHostBytes = 0;
-        if ((allocationResult == VK_ERROR_OUT_OF_HOST_MEMORY || allocationResult == VK_ERROR_OUT_OF_DEVICE_MEMORY) && (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
-            releasedHostBytes = cache->ReleaseUnusedHostMemory(context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex);
-            if (releasedHostBytes != 0) {
-                memory = VK_NULL_HANDLE;
-                allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
-                std::fprintf(stderr, "[buffer-memory] bytes=%llu released-unused-host=%llu retry-result=%d\n", static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(releasedHostBytes), static_cast<int>(allocationResult));
-            }
-        }
         if ((allocationResult == VK_ERROR_OUT_OF_HOST_MEMORY || allocationResult == VK_ERROR_OUT_OF_DEVICE_MEMORY) && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
             const auto exhaustedType = allocation.memoryTypeIndex;
+            const auto exhaustedResult = allocationResult;
             const auto exhaustedHeap = context.memory.memoryTypes[exhaustedType].heapIndex;
             constexpr VkMemoryPropertyFlags ordinaryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
             for (std::uint32_t type = 0; type < context.memory.memoryTypeCount; ++type) {
@@ -72,7 +65,20 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 memory = VK_NULL_HANDLE;
                 allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
                 std::fprintf(stderr, "[buffer-memory] bytes=%llu exhausted-type=%u alternate-type=%u alternate-heap=%u alternate-result=%d\n", static_cast<unsigned long long>(allocation.allocationSize), exhaustedType, type, candidate.heapIndex, static_cast<int>(allocationResult));
+                if (allocationResult == VK_ERROR_OUT_OF_HOST_MEMORY || allocationResult == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                    allocation.memoryTypeIndex = exhaustedType;
+                    allocationResult = exhaustedResult;
+                    memory = VK_NULL_HANDLE;
+                }
                 break;
+            }
+        }
+        if ((allocationResult == VK_ERROR_OUT_OF_HOST_MEMORY || allocationResult == VK_ERROR_OUT_OF_DEVICE_MEMORY) && (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            releasedHostBytes = cache->ReleaseUnusedHostMemory(context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex);
+            if (releasedHostBytes != 0) {
+                memory = VK_NULL_HANDLE;
+                allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
+                std::fprintf(stderr, "[buffer-memory] bytes=%llu released-unused-host=%llu retry-result=%d\n", static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(releasedHostBytes), static_cast<int>(allocationResult));
             }
         }
         if (allocationResult != VK_SUCCESS) {

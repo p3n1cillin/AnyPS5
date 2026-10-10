@@ -43,6 +43,7 @@ struct MockDevice {
     std::vector<std::uint32_t> allocationTypes;
     std::vector<VkMemoryAllocateFlags> allocationFlags;
     std::map<VkDeviceMemory, std::uint32_t> memoryTypes;
+    VkResult alternateFailure = VK_SUCCESS;
 };
 
 MockDevice mock;
@@ -63,6 +64,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAlloca
     mock.allocationTypes.push_back(info->memoryTypeIndex);
     mock.allocationFlags.push_back(info->pNext == nullptr ? 0 : static_cast<const VkMemoryAllocateFlagsInfo*>(info->pNext)->flags);
     if (mock.allocationResult != VK_SUCCESS) return mock.allocationResult;
+    if (info->memoryTypeIndex >= 2 && mock.alternateFailure != VK_SUCCESS) return mock.alternateFailure;
     if (info->memoryTypeIndex == 1 && mock.liveHostBytes + info->allocationSize > mock.maxHostBytes) return mock.budgetFailure;
     *memory = reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(mock.next++));
     if (info->memoryTypeIndex != 0) {
@@ -360,12 +362,15 @@ void AlternateHostHeap() {
             auto context = alternateHeapContext();
             Buffer live(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             live.Bytes().front() = std::byte{0x42};
+            VkBuffer unusedHandle = VK_NULL_HANDLE;
             if (reclaim) {
                 Buffer unused(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                unusedHandle = unused.Handle();
+                unused.Bytes().front() = std::byte{0x55};
             }
             mock.maxHostBytes = 4 * MiB;
             const auto attempts = mock.allocationAttempts;
-            const auto expected = reclaim ? 3u : 2u;
+            const auto expected = 2u;
             VkBuffer handle = VK_NULL_HANDLE;
             constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
             {
@@ -382,6 +387,10 @@ void AlternateHostHeap() {
             Expect(mock.allocationAttempts == retainedAttempts + 2 && mock.frees == retainedFrees, "pressure recovery discarded reusable memory from a different heap");
             Buffer reused(context, 9 * MiB, usage);
             Expect(reused.Handle() == handle && mock.allocationAttempts == retainedAttempts + 2 && reused.Bytes().front() == std::byte{0x73} && reused.Bytes().back() == std::byte{0x39}, "an alternate-heap allocation was not retained and reused intact");
+            if (reclaim) {
+                Buffer originalCache(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                Expect(originalCache.Handle() == unusedHandle && originalCache.Bytes().front() == std::byte{0x55} && mock.allocationAttempts == retainedAttempts + 2 && mock.frees == 0, "a successful alternate allocation discarded the original heap's reusable cache");
+            }
         }
     }
 }
@@ -427,8 +436,10 @@ void MixedHeapPool() {
     mock.memoryTypeBits = 7;
     auto context = alternateHeapContext();
     VkBuffer alternateHandle = VK_NULL_HANDLE;
+    VkBuffer originalHandle = VK_NULL_HANDLE;
     {
         Buffer original(context, MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        originalHandle = original.Handle();
         original.Bytes().front() = std::byte{0x42};
         mock.maxHostBytes = MiB;
         Buffer alternate(context, MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -438,9 +449,37 @@ void MixedHeapPool() {
     }
     const auto attempts = mock.allocationAttempts;
     Buffer different(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    Expect(mock.frees == 1 && mock.liveHostBytes == 0 && mock.allocationAttempts == attempts + 3, "mixed-heap pool recovery did not release only the exhausted heap");
+    Expect(mock.frees == 0 && mock.liveHostBytes == MiB && mock.allocationAttempts == attempts + 2, "a successful alternate allocation discarded mixed-heap cache entries");
     Buffer reused(context, MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    Expect(reused.Handle() == alternateHandle && reused.Bytes().front() == std::byte{0x73} && mock.allocationAttempts == attempts + 3, "mixed-heap pool recovery discarded the retained alternate allocation");
+    Buffer reusedOther(context, MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto intact = [&](const Buffer& buffer) { return buffer.Handle() == originalHandle || buffer.Handle() == alternateHandle; };
+    Expect(intact(reused) && intact(reusedOther) && reused.Handle() != reusedOther.Handle() && mock.allocationAttempts == attempts + 2, "mixed-heap pool recovery discarded a retained allocation");
+    Expect((reused.Handle() == originalHandle ? reused.Bytes().front() : reusedOther.Bytes().front()) == std::byte{0x42} && (reused.Handle() == alternateHandle ? reused.Bytes().front() : reusedOther.Bytes().front()) == std::byte{0x73}, "mixed-heap reuse altered mapped contents");
+}
+
+void AlternateHeapFailure() {
+    for (const auto failure : {VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_DEVICE_LOST}) {
+        mock = MockDevice{};
+        mock.memoryTypeBits = 7;
+        auto context = alternateHeapContext();
+        Buffer live(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        live.Bytes().front() = std::byte{0x42};
+        {
+            Buffer unused(context, 8 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        }
+        mock.maxHostBytes = 13 * MiB;
+        mock.alternateFailure = failure;
+        const auto attempts = mock.allocationAttempts;
+        bool rejected = false;
+        try {
+            Buffer recovered(context, 9 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            Expect(failure != VK_ERROR_DEVICE_LOST && mock.allocationAttempts == attempts + 3 && mock.frees == 1 && mock.allocationTypes.back() == 1, "both-heap pressure did not reclaim the original heap and retry it once");
+        } catch (const std::runtime_error& error) {
+            rejected = true;
+            Expect(failure == VK_ERROR_DEVICE_LOST && std::string(error.what()).find("Vulkan result -4") != std::string::npos && mock.allocationAttempts == attempts + 2 && mock.frees == 0, "a non-memory error from the alternate heap was masked or reclaimed working cache");
+        }
+        Expect(rejected == (failure == VK_ERROR_DEVICE_LOST) && live.Bytes().front() == std::byte{0x42}, "alternate-heap failure changed a live buffer or the failure contract");
+    }
 }
 
 }
@@ -459,6 +498,7 @@ int main() {
         AlternateHostHeap();
         AlternateHostHeapGuards();
         MixedHeapPool();
+        AlternateHeapFailure();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
