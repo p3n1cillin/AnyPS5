@@ -297,14 +297,15 @@ public:
     DepthPlaneCopy(const DepthPlaneCopy&) = delete;
     DepthPlaneCopy& operator=(const DepthPlaneCopy&) = delete;
 
-    std::shared_ptr<Texture> Refresh(std::span<const VkImage> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
+    std::shared_ptr<Texture> Refresh(const Context& uploadContext, std::span<const VkImage> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
+        Require(uploadContext.device == context.device, "depth plane upload belongs to another device");
         Require(slices.size() == layers, "depth plane copy slices do not match its layers");
         const auto geometry = DescribeSurface(resource);
         Require(geometry.layers == layers && geometry.sliceLinearBytes == sliceBytes() && !geometry.mips.empty(), "depth plane copy geometry does not match its layers");
         std::vector<std::shared_ptr<Buffer>> uploads;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             if (slices[layer] != VK_NULL_HANDLE) continue;
-            auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            auto upload = std::make_shared<Buffer>(uploadContext, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             GuestMemory::ReadCommitted(resource.baseAddress + geometry.GuestLayerOffset(layer), upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
             uploads.push_back(std::move(upload));
         }
@@ -698,7 +699,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     if (copy == nullptr) {
         copy = std::make_unique<DepthPlaneCopy>(context, base.extent, imageFormat, layers);
     }
-    return copy->Refresh(slices, resource, components, cube || resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D);
+    return copy->Refresh(context, slices, resource, components, cube || resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D);
 }
 
 void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageTexture>& storage) {

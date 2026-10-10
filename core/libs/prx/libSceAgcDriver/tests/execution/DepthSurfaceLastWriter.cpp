@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -133,6 +134,22 @@ private:
 };
 
 constexpr std::size_t Block = 65536;
+
+PFN_vkGetDeviceProcAddr uploadResolver = nullptr;
+std::uint32_t newDepthUploads = 0;
+
+VKAPI_ATTR VkResult VKAPI_CALL refuseDepthUpload(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* callbacks, VkBuffer* buffer) {
+    if (info->size == Block && info->usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+        ++newDepthUploads;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    return reinterpret_cast<PFN_vkCreateBuffer>(uploadResolver(device, "vkCreateBuffer"))(device, info, callbacks, buffer);
+}
+
+PFN_vkVoidFunction VKAPI_CALL depthUploadProc(VkDevice device, const char* name) {
+    if (std::string_view(name) == "vkCreateBuffer") return reinterpret_cast<PFN_vkVoidFunction>(refuseDepthUpload);
+    return uploadResolver(device, name);
+}
 
 void* AllocateWatched(std::size_t bytes) {
 #ifdef _WIN32
@@ -269,6 +286,38 @@ void ColorStorageWriter(const Context& context, std::uint64_t address) {
         throw;
     }
     ClearCachedTextures(context.device);
+}
+
+void DepthArraySharedPool(const Context& context) {
+    alignas(256) static std::array<std::uint32_t, 2 * Block / 4> depth;
+    depth.fill(0x3e800000);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto configured = context;
+    configured.bufferPool = std::make_shared<BufferPool>(context);
+    TextureDetiler detiler(configured);
+    configured.detiler = &detiler;
+    const auto address = reinterpret_cast<std::uintptr_t>(depth.data());
+    constexpr VkExtent2D extent{128, 128};
+    DepthSurfaceView(configured, Depth(address, extent));
+    {
+        Buffer unused(configured, Block, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    uploadResolver = context.deviceProc;
+    newDepthUploads = 0;
+    configured.deviceProc = depthUploadProc;
+    auto resource = View(extent.width, extent.height, address);
+    resource.dimension = TextureDimension::k2DArray;
+    resource.depthOrLastArray = 1;
+    resource.tileMode = TextureTileMode::kZ64KBX;
+    try {
+        const auto sampled = Sample(configured, resource);
+        Require(sampled != nullptr && sampled->View() != VK_NULL_HANDLE && sampled->SampledViewRange(false).type == VK_IMAGE_VIEW_TYPE_2D_ARRAY && sampled->SampledViewRange(false).layers == VK_REMAINING_ARRAY_LAYERS && sampled->RefreshedPerUse(), "a mixed resident/guest depth array did not produce its refreshed array view");
+        Require(newDepthUploads == 0, "a depth array upload ignored the caller's reusable host buffer");
+    } catch (...) {
+        ClearDepthSurfaces(context.device);
+        throw;
+    }
+    ClearDepthSurfaces(context.device);
 }
 
 void ResummarizeStorageWriter(const Context& context) {
@@ -434,6 +483,7 @@ int main() {
         }
         Run(device->GetContext());
         ResummarizeStorageWriter(device->GetContext());
+        DepthArraySharedPool(device->GetContext());
         std::puts("depth surface last writer tests passed");
         return 0;
     } catch (const std::exception& error) {
