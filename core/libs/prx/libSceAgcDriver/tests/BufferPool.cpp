@@ -376,8 +376,12 @@ void AlternateHostHeap() {
                 Expect(mock.allocationAttempts == attempts + expected && mock.allocationTypes.back() == 2, "host pressure did not try one compatible alternate heap after checking unused memory");
                 Expect(live.Bytes().front() == std::byte{0x42} && recovered.Bytes().size() == 9 * MiB && recovered.DeviceAddress() != 0 && mock.allocationFlags.back() == VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, "alternate-heap recovery altered a live buffer, mapping or device address");
             }
+            const auto retainedAttempts = mock.allocationAttempts;
+            const auto retainedFrees = mock.frees;
+            Buffer different(context, 7 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            Expect(mock.allocationAttempts == retainedAttempts + 2 && mock.frees == retainedFrees, "pressure recovery discarded reusable memory from a different heap");
             Buffer reused(context, 9 * MiB, usage);
-            Expect(reused.Handle() == handle && mock.allocationAttempts == attempts + expected && reused.Bytes().front() == std::byte{0x73} && reused.Bytes().back() == std::byte{0x39}, "an alternate-heap allocation was not retained and reused intact");
+            Expect(reused.Handle() == handle && mock.allocationAttempts == retainedAttempts + 2 && reused.Bytes().front() == std::byte{0x73} && reused.Bytes().back() == std::byte{0x39}, "an alternate-heap allocation was not retained and reused intact");
         }
     }
 }
@@ -418,6 +422,27 @@ void AlternateHostHeapGuards() {
     }
 }
 
+void MixedHeapPool() {
+    mock = MockDevice{};
+    mock.memoryTypeBits = 7;
+    auto context = alternateHeapContext();
+    VkBuffer alternateHandle = VK_NULL_HANDLE;
+    {
+        Buffer original(context, MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        original.Bytes().front() = std::byte{0x42};
+        mock.maxHostBytes = MiB;
+        Buffer alternate(context, MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        alternateHandle = alternate.Handle();
+        alternate.Bytes().front() = std::byte{0x73};
+        Expect(original.Bytes().front() == std::byte{0x42}, "alternate allocation changed the original-heap buffer");
+    }
+    const auto attempts = mock.allocationAttempts;
+    Buffer different(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Expect(mock.frees == 1 && mock.liveHostBytes == 0 && mock.allocationAttempts == attempts + 3, "mixed-heap pool recovery did not release only the exhausted heap");
+    Buffer reused(context, MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Expect(reused.Handle() == alternateHandle && reused.Bytes().front() == std::byte{0x73} && mock.allocationAttempts == attempts + 3, "mixed-heap pool recovery discarded the retained alternate allocation");
+}
+
 }
 
 int main() {
@@ -433,6 +458,7 @@ int main() {
         PersistentAllocationFailure();
         AlternateHostHeap();
         AlternateHostHeapGuards();
+        MixedHeapPool();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

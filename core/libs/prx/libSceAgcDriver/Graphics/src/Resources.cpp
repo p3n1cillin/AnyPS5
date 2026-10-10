@@ -20,6 +20,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         mapping = allocation->mapping;
         deviceAddress = allocation->address;
         allocationBytes = allocation->allocationBytes;
+        heapIndex = allocation->heapIndex;
         capacity = allocation->bytes;
         ready = true;
         return;
@@ -53,7 +54,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         auto allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
         VkDeviceSize releasedHostBytes = 0;
         if ((allocationResult == VK_ERROR_OUT_OF_HOST_MEMORY || allocationResult == VK_ERROR_OUT_OF_DEVICE_MEMORY) && (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
-            releasedHostBytes = cache->ReleaseUnusedHostMemory();
+            releasedHostBytes = cache->ReleaseUnusedHostMemory(context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex);
             if (releasedHostBytes != 0) {
                 memory = VK_NULL_HANDLE;
                 allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
@@ -90,6 +91,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             operation << " released-unused-host=" << releasedHostBytes << ')';
             Check(allocationResult, operation.str().c_str());
         }
+        heapIndex = context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex;
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
@@ -106,7 +108,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, heapIndex});
         return;
     }
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
@@ -138,6 +140,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         buffer = allocation->buffer;
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
+        heapIndex = allocation->heapIndex;
         capacity = allocation->bytes;
         return;
     }
@@ -153,6 +156,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        heapIndex = context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex;
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory device buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
@@ -167,7 +171,7 @@ DeviceBuffer::~DeviceBuffer() {
 
 void DeviceBuffer::release() noexcept {
     if (buffer && memory && cache) {
-        cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT});
+        cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, heapIndex});
         return;
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
