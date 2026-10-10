@@ -291,6 +291,12 @@ void Driver::execute(const Submission& submission) {
                     if (dumpRejectedDraw) {
                         std::ostringstream state;
                         state << "[draw-rejected] submission=" << submission.serial << " queue=" << std::hex << submission.queue << " offset=" << std::dec << cursor << " reason=" << error.what() << '\n';
+                        try {
+                            const auto parameters = Pm4::ResolveDraw(packet, queue);
+                            state << "[draw-rejected] parameters indices=" << parameters.indexCount << " instances=" << parameters.instanceCount << " first-instance=" << parameters.firstInstance << " first-vertex=" << parameters.firstVertex << " indirect=" << parameters.indirect.has_value() << '\n';
+                        } catch (const std::exception& parameterError) {
+                            state << "[draw-rejected] parameters unavailable: " << parameterError.what() << '\n';
+                        }
                         state << "[draw-rejected] packet" << std::hex;
                         for (const auto word : packet) state << ' ' << word;
                         state << '\n';

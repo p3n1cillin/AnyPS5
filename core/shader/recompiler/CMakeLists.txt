@@ -211,6 +211,7 @@ function(add_shader_recompiler target runtimeTarget)
             CaptureResources
             DebugProbeActive
             DepthBitsTextureWidth
+            DecodePositionExportComponent
             HashBytes
             PixelInput
             PixelInputBit
@@ -221,6 +222,7 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileCacheKey::ContextHash
             RecompileResult
             PrepareShader
+            PrepareResourceProgram
             GetPreparedCode
             PreparedShaderInvocation::TryCreate
             MatchesPreparedShader

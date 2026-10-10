@@ -870,6 +870,39 @@ void depthMaintenanceTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "D32 depth-only HTILE");
 }
 
+void vertexRoutingTests() {
+    alignas(256) static constexpr std::array<std::uint32_t, 6> instance{0x7e000280, 0xf80000d4, 0x00080000, 0xf80008cf, 0, 0xbf810000};
+    alignas(256) static constexpr std::array<std::uint32_t, 6> zero{0x7e000280, 0xf80000d4, 0, 0xf80008cf, 0, 0xbf810000};
+    alignas(256) static constexpr std::array<std::uint32_t, 6> one{0x7e000281, 0xf80000d4, 0, 0xf80008cf, 0, 0xbf810000};
+    alignas(256) static constexpr std::array<std::uint32_t, 6> varying{0x7e000280, 0xf80000d4, 0x00050000, 0xf80008cf, 0, 0xbf810000};
+    alignas(256) static constexpr std::array<std::uint32_t, 6> missing{0x7e000280, 0xf80008cf, 0, 0xf80000d4, 0, 0xbf810000};
+    alignas(256) static constexpr std::array<std::uint32_t, 7> masked{0x7e000280, 0xf80000d4, 0, 0xbefe0480, 0xf80008cf, 0, 0xbf810000};
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader.stage = ShaderRecompiler::ShaderStage::Vertex;
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 8;
+    request.context.vertex = ShaderRecompiler::ShaderVertexStageInfo{};
+    request.target.subgroupSize = 32;
+    request.shader.code = instance;
+    constexpr std::uint32_t control = 0x01240000;
+    const auto proof = [&](std::uint32_t first, std::uint32_t count) { AgcDriver::Graphics::RequireZeroVertexRouting(request, control, first, count); };
+    proof(0, 1);
+    expectFailure([&] { proof(1, 1); }, "not proved zero");
+    expectFailure([&] { proof(0, 2); }, "not proved zero");
+    request.shader.code = zero;
+    proof(5, 8);
+    AgcDriver::Graphics::RequireZeroVertexRouting(request, 0x01280000, 5, 8);
+    AgcDriver::Graphics::RequireZeroVertexRouting(request, 0x012c0000, 5, 8);
+    request.shader.code = one;
+    expectFailure([&] { proof(0, 1); }, "not proved zero");
+    request.shader.code = varying;
+    expectFailure([&] { proof(0, 1); }, "not proved zero");
+    request.shader.code = missing;
+    expectFailure([&] { proof(0, 1); }, "no matching zero");
+    request.shader.code = masked;
+    expectFailure([&] { proof(0, 1); }, "no matching zero");
+}
+
 // SPI_SHADER_Z_FORMAT (0x1c4) and the export enables of DB_SHADER_CONTROL (0x203): Z export needs a
 // format with a depth channel (1, 2, 3 or 32_ABGR 9), the sample mask needs 32_ABGR, and the
 // formats the export path does not lay out are refused. A missing 0x1c4 gives no verdict here.
@@ -2948,6 +2981,7 @@ int main() {
         RunGuestLeaseWaitTests();
         stateTests();
         depthMaintenanceTests();
+        vertexRoutingTests();
         hardwareScreenOffsetTests();
         srgb8TargetTests();
         DepthClipTests();

@@ -524,7 +524,6 @@ State DecodeState(const QueueState& queue) {
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
     result.primitiveRestart = read(queue.userConfig, 0x24b, RegisterBank::UserConfig) != 0 && !result.rectList && result.topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
     if ((read(cx, 0x207) & LayerExports) != 0) {
-        Require(!result.depthResummarize, "resummarization with layer or viewport exports is unmeasured");
         static bool reported = false;
         if (!reported) {
             reported = true;

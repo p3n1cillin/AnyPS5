@@ -137,6 +137,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
     };
+    const bool proveRouting = graphics.depthResummarize && (queue.context.at(0x207) & ((1u << 18u) | (1u << 19u))) != 0;
+    if (proveRouting) {
+        require(!drawParameters.indirect, "indirect resummarization routing is unmeasured");
+    }
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
@@ -217,6 +221,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         require(result.pushConstants.size() <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
+    }
+
+    if (proveRouting) {
+        decodeVertexInfo(0);
+        const auto& vertex = programs.front();
+        const ShaderRecompiler::RecompileRequest routing{
+            vertex.binary,
+            {graphics.stages.vertexWaveSize, vertex.firstUserSgpr, vertex.userData, std::nullopt, std::nullopt, vertexInfos.front(), memory, RegisteredFloatMode(*vertex.snapshot)},
+            localDevice->Target(), {0, 0, 0, 128},
+            ShaderRecompiler::GraphicsCompileContext{vertex.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
+        };
+        Graphics::RequireZeroVertexRouting(routing, queue.context.at(0x207), drawParameters.firstInstance, drawParameters.instanceCount);
+        static const bool traceRouting = std::getenv("APS5_TRACE_DEPTH_RESUMMARIZE") != nullptr;
+        if (traceRouting) std::fprintf(stderr, "[depth-resummarize-routing] indices=%u instances=%u first-instance=%u control=0x%08x proof=zero\n", drawParameters.indexCount, drawParameters.instanceCount, drawParameters.firstInstance, queue.context.at(0x207));
     }
 
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);

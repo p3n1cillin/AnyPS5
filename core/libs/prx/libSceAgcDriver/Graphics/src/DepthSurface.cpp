@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -524,6 +525,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
 }
 
 void ResummarizeDepthSurface(const Context& context, const DepthTarget& target, std::span<const std::uint8_t> coverage) {
+    PerformanceTimer timing("Graphics.ResummarizeDepth");
     Require(!target.htileStencil && (target.format == VK_FORMAT_D32_SFLOAT || target.format == VK_FORMAT_D32_SFLOAT_S8_UINT), "depth resummarization requires measured D32 depth-only HTILE encoding");
     const auto metadataBytes = static_cast<std::size_t>(HtileSliceBytes(target.extent));
     const auto pixelCount = static_cast<std::size_t>(target.extent.width) * target.extent.height;
@@ -628,6 +630,9 @@ void ResummarizeDepthSurface(const Context& context, const DepthTarget& target, 
         resident->htileGeneration = GuestMemory::CollectWrites(target.htileAddress, metadataBytes);
         resident->NoteWritten();
     }
+    static const bool trace = std::getenv("APS5_TRACE_DEPTH_RESUMMARIZE") != nullptr;
+    static std::atomic<std::uint32_t> traced{0};
+    if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 256) std::fprintf(stderr, "[depth-resummarize] address=0x%llx extent=%ux%u tiles=%zu slice=%u first=0x%08x\n", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, tiles.size(), target.htileSlice, metadata[(HtileWordOffset(target.extent, tiles.front().first, tiles.front().second, target.htileSlice, target.htilePipeXor) % metadataBytes) / 4u]);
 }
 
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {

@@ -3,6 +3,7 @@
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -12,6 +13,42 @@
 #include <string>
 
 namespace AgcDriver::Graphics {
+void RequireZeroVertexRouting(const ShaderRecompiler::RecompileRequest& request, std::uint32_t control, std::uint32_t firstInstance, std::uint32_t instanceCount) {
+    if ((control & ((1u << 18u) | (1u << 19u))) == 0 || instanceCount == 0) return;
+    Require(request.shader.stage == ShaderRecompiler::ShaderStage::Vertex, "resummarization routing requires a vertex-stage proof");
+    const auto program = ShaderRecompiler::PrepareResourceProgram(request);
+    bool position = false;
+    for (const auto& block : program.Blocks()) {
+        const ShaderRecompiler::IrValue* provedExec = nullptr;
+        for (const auto* instruction : block->Instructions()) {
+            if (instruction->Opcode() != ShaderRecompiler::IrOpcode::SetAttribute) continue;
+            const auto flags = instruction->Flags<ShaderRecompiler::ExportFlags>();
+            const auto& output = program.Metadata().exportInfo.at(flags.index);
+            if (output.kind != ShaderRecompiler::ExportTargetKind::Position || output.en == 0) continue;
+            const auto* exec = instruction->Argument(1)->Resolve();
+            if (output.index == 0) {
+                Require(provedExec == exec, "resummarization position has no matching zero layer/viewport export");
+                position = true;
+                continue;
+            }
+            for (std::uint32_t component = 0; component < 4; ++component) {
+                if ((output.en & (1u << component)) == 0) continue;
+                const auto route = ShaderRecompiler::DecodePositionExportComponent(control, output.index, component);
+                if (!route.layer && !route.viewport) continue;
+                Require(!output.compr, "compressed resummarization routing exports are unsupported");
+                const auto* data = instruction->Argument(0)->Resolve();
+                Require(data->Opcode() == ShaderRecompiler::IrOpcode::CompositeConstructU32x4 && data->ArgumentCount() == 4, "resummarization routing is not a known export vector");
+                const auto* value = data->Argument(component)->Resolve();
+                const bool constantZero = value->HasImmediate() && value->ImmediateU32() == 0;
+                const bool instanceZero = value->Opcode() == ShaderRecompiler::IrOpcode::GetBuiltin && value->ArgumentCount() == 2 && value->Argument(0)->Resolve()->HasImmediate() && value->Argument(0)->Resolve()->ImmediateU32() == static_cast<std::uint32_t>(ShaderRecompiler::StageInputKind::InstanceIndex) && value->Argument(1)->Resolve()->HasImmediate() && value->Argument(1)->Resolve()->ImmediateU32() == 0 && firstInstance == 0 && instanceCount == 1;
+                Require(constantZero || instanceZero, "resummarization layer/viewport export is not proved zero for this draw");
+                provedExec = exec;
+            }
+        }
+    }
+    Require(position, "resummarization routing proof has no position export");
+}
+
 namespace {
 
 constexpr std::uint32_t computeNumThreadX = 0x207;
