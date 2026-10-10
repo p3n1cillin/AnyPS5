@@ -20,7 +20,7 @@ using ShaderRecompiler::ShaderStage;
 inline constexpr std::uint32_t Width = 64;
 inline constexpr std::uint32_t Height = 32;
 inline constexpr std::uint32_t Covered = Width * Height;
-inline constexpr std::size_t HtileBytes = ((Width + 7u) / 8u) * ((Height + 7u) / 8u) * 4u;
+inline constexpr std::size_t HtileBytes = 32768u;
 
 alignas(256) inline std::array<std::byte, Width * Height * 4> Pixels{};
 

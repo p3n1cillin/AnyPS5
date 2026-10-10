@@ -17,7 +17,7 @@ using DepthFastClearHarness::Surface;
 using DepthFastClearHarness::Width;
 
 alignas(4096) std::array<float, Width * Height * 2> Depth{};
-alignas(256) std::array<std::uint32_t, 1024> Htile{};
+alignas(256) std::array<std::uint32_t, HtileBytes / 4u> Htile{};
 
 }
 

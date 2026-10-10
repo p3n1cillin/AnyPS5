@@ -20,6 +20,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -710,6 +711,7 @@ void DepthStencilTests() {
     for (const auto offset : {0x012u, 0x014u}) queue.context[offset] = 0x100;
     for (const auto offset : {0x013u, 0x015u}) queue.context[offset] = 0x200;
     queue.context[0x005] = 0x300;
+    queue.context[0x2af] = 1u << 18u;
     queue.context[0x01e] = 0x1;
     queue.context[0x10b] = 0x00050050;
     queue.context[0x10c] = 0x01ffff01;
@@ -743,8 +745,23 @@ void DepthStencilTests() {
         Require(HtileFillClears(0xfffff0ffu, true) == VK_IMAGE_ASPECT_STENCIL_BIT, "ZMask 0xf with SMem 0 clears only the stencil");
         Require(HtileFillClears(0xffffffffu, true) == 0 && HtileFillClears(0xffffffffu, false) == 0, "an expanded fill clears nothing");
         const VkExtent2D extent{16, 8};
-        Require(HtileFillCovers(0x1000, extent, 0x1000, 8) && HtileFillCovers(0x1000, extent, 0xff0, 0x20), "a fill over every HTILE word covers the surface");
-        Require(!HtileFillCovers(0x1000, extent, 0x1000, 4) && !HtileFillCovers(0x1000, extent, 0x1004, 8) && !HtileFillCovers(0, extent, 0, 64), "a partial fill, one starting past the HTILE base, or no HTILE covers nothing");
+        Require(HtileFillCovers(0x1000, extent, 0x1000, 32768) && HtileFillCovers(0x1000, extent, 0xff0, 32784), "a fill over the padded HTILE covers the surface");
+        Require(!HtileFillCovers(0x1000, extent, 0x1000, 8) && !HtileFillCovers(0x1000, extent, 0x1000, 32764) && !HtileFillCovers(0x1000, extent, 0x1004, 32768) && !HtileFillCovers(0, extent, 0, 32768), "a compact prefix, partial fill, one starting past the HTILE base, or no HTILE covers nothing");
+        Require(!HtileFillCovers(0x1000, extent, 0x2000, std::numeric_limits<std::size_t>::max()), "a wrapping fill starting beyond the HTILE covers nothing");
+        Require(AgcDriver::Graphics::HtileSliceBytes({1920, 1080}) == 196608 && AgcDriver::Graphics::HtileSliceBytes({2432, 1368}) == 294912, "HTILE size differs from AMD addrlib for multi-block surfaces");
+        Require(AgcDriver::Graphics::HtileWordOffset({1920, 1080}, 8, 0) == 260 && AgcDriver::Graphics::HtileWordOffset({1920, 1080}, 0, 8) == 256, "HTILE tile coordinates were treated as linear words");
+        queue.context[0x002] = 1u | (1u << 13u);
+        queue.context[0x005] = 0x307;
+        const auto sliced = AgcDriver::Graphics::DecodeState(queue);
+        Require(sliced.depth && sliced.depth->htileAddress == 0x10000038000ull && sliced.depth->htileSlice == 1u && sliced.depth->htilePipeXor == 7u, "HTILE slice and encoded pipe XOR were not separated from the backing address");
+        queue.context[0x002] = 0;
+        queue.context[0x005] = 0x300;
+        queue.context[0x2af] = 0;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PIPE_ALIGNED");
+        queue.context[0x2af] = 1u << 18u;
+        queue.context[0x010] ^= 1u << 4u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "SW_64KB_Z_X");
+        queue.context[0x010] ^= 1u << 4u;
     }
     Require(state.renderExtent.width == 4 && state.renderExtent.height == 2, "render extent ignores the depth surface");
     Require(!state.depthTest && !state.depthWrite && state.stencilTest, "depth/stencil enables changed");

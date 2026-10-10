@@ -18,19 +18,22 @@ using DepthFastClearHarness::Require;
 using DepthFastClearHarness::Surface;
 using DepthFastClearHarness::Width;
 
-constexpr std::size_t Tiles = HtileBytes / 4u;
+constexpr std::size_t Tiles = ((Width + 7u) / 8u) * ((Height + 7u) / 8u);
 
 alignas(4096) std::array<float, Width * Height * 2> Depth{};
 alignas(4096) std::array<float, Width * Height> StencilDepth{};
 alignas(4096) std::array<std::uint8_t, Width * Height> Stencil{};
-alignas(256) std::array<std::uint32_t, 1024> Htile{};
+alignas(256) std::array<std::uint32_t, 8192> Htile{};
 
 void Fill(std::uint32_t word, std::size_t count = Tiles) {
-    std::fill_n(Htile.begin(), count, word);
+    for (std::size_t tile = 0; tile < count; ++tile) Htile[AgcDriver::Graphics::HtileWordOffset({Width, Height}, static_cast<std::uint32_t>(tile % (Width / 8u)) * 8u, static_cast<std::uint32_t>(tile / (Width / 8u)) * 8u) / 4u] = word;
 }
 
 bool Holds(std::uint32_t word) {
-    return std::all_of(Htile.begin(), Htile.begin() + Tiles, [&](std::uint32_t value) { return value == word; });
+    for (std::size_t tile = 0; tile < Tiles; ++tile) {
+        if (Htile[AgcDriver::Graphics::HtileWordOffset({Width, Height}, static_cast<std::uint32_t>(tile % (Width / 8u)) * 8u, static_cast<std::uint32_t>(tile / (Width / 8u)) * 8u) / 4u] != word) return false;
+    }
+    return true;
 }
 
 DrawOptions StencilDraw(VkCompareOp compare, std::uint32_t reference, VkStencilOp op) {
@@ -53,11 +56,17 @@ int main() {
         const Surface depth{reinterpret_cast<std::uintptr_t>(Depth.data()), 0, reinterpret_cast<std::uintptr_t>(Htile.data()), false, VK_FORMAT_D32_SFLOAT};
         Require(Draw(*device, shaders, depth, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
         Require(Draw(*device, shaders, depth, {}) == 0u, "a draw at depth 0.5 passed LESS against the 0.5 written before it");
+        Htile.fill(0xfffc000fu);
+        std::fill_n(Htile.begin(), Tiles, 0u);
+        Require(Draw(*device, shaders, depth, {}) == 0u, "clearing only the compact HTILE prefix cleared tiles outside that prefix");
+        Htile.fill(0xfffc000fu);
         Fill(0u, Tiles - 1);
         Require(Draw(*device, shaders, depth, {}) == 0u, "an HTILE with one tile left expanded cleared the depth");
         Fill(0u);
+        Htile[4] = 0xabcdef0fu;
         Require(Draw(*device, shaders, depth, {.depthWrite = true}) == Covered, "an HTILE written with ZMask 0 on every tile did not clear the depth to DB_DEPTH_CLEAR (1.0)");
         Require(Holds(0xfffc000fu), "the HTILE of the cleared depth was not stored back as expanded");
+        Require(Htile[4] == 0xabcdef0fu, "materializing a depth clear overwrote padding metadata");
         Require(Draw(*device, shaders, depth, {}) == 0u, "the depth written after the clear was cleared again");
 
         Fill(0xfffff3ffu);

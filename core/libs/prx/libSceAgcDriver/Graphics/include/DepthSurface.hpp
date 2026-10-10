@@ -13,6 +13,8 @@ class Texture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
+std::uint64_t HtileSliceBytes(VkExtent2D extent);
+std::uint64_t HtileWordOffset(VkExtent2D extent, std::uint32_t x, std::uint32_t y, std::uint32_t slice = 0, std::uint32_t pipeXor = 0);
 void ClearDepthSurfaces(VkDevice device);
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes);
 bool DepthSurfaceAt(std::uint64_t address);

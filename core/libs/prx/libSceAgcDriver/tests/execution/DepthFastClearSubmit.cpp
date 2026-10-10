@@ -97,7 +97,7 @@ void DispatchFill(const GuestBlock& code, const GuestBlock& htile, std::uint32_t
         Pm4Packet(0x76, {0x207, 64}),
         Pm4Packet(0x76, {0x208, 1}),
         Pm4Packet(0x76, {0x209, 1}),
-        Pm4Packet(0x76, {0x213, 8u << 1u}),
+        Pm4Packet(0x76, {0x213, (8u << 1u) | (1u << 7u)}),
         Pm4Packet(0x76, {0x240, Low(base)}),
         Pm4Packet(0x76, {0x241, (High(base) & 0xffffu) | (16u << 16u)}),
         Pm4Packet(0x76, {0x242, records}),
@@ -106,7 +106,7 @@ void DispatchFill(const GuestBlock& code, const GuestBlock& htile, std::uint32_t
         Pm4Packet(0x76, {0x245, 0}),
         Pm4Packet(0x76, {0x246, 0}),
         Pm4Packet(0x76, {0x247, 0}),
-        Pm4Packet(0x15, {1, 1, 1, 0x41}),
+        Pm4Packet(0x15, {(records + 63u) / 64u, 1, 1, 0x41}),
     });
 }
 
@@ -123,7 +123,7 @@ void DmaFillClearsDepth(AgcDriver::VulkanDevice& device, const Shaders& shaders)
     const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
     Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
     Require(Draw(device, shaders, surface, {}) == 0u, "a draw at depth 0.5 passed LESS against the 0.5 written before it");
-    DmaFill(htile, HtileFillBytes - 4u, 0u);
+    DmaFill(htile, ((DepthFastClearHarness::Width + 7u) / 8u) * ((DepthFastClearHarness::Height + 7u) / 8u) * 4u, 0u);
     Require(Draw(device, shaders, surface, {}) == 0u, "a DMA_DATA fill shorter than the HTILE cleared the depth");
     DmaFill(htile, HtileFillBytes, 0xffffffffu);
     Require(Draw(device, shaders, surface, {}) == 0u, "a DMA_DATA fill expanded to ZMask 0xf cleared the depth");

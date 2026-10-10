@@ -224,7 +224,13 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     depth.clearDepth = readFloat(cx, 0x00b);
     depth.clearStencil = static_cast<std::uint8_t>(read(cx, 0x00a) & 0xffu);
     if (const auto htile = find(cx, 0x005); htile != cx.end() && htile->second != 0 && (read(cx, 0x010) & (1u << 29u)) != 0) {
-        depth.htileAddress = base(0x005, 0x01e);
+        Require(((read(cx, 0x010) >> 4u) & 0x1fu) == 24u, "HTILE requires SW_64KB_Z_X depth");
+        Require((read(cx, 0x2af) & (1u << 18u)) != 0, "HTILE without PIPE_ALIGNED is unsupported");
+        const auto htileBase = base(0x005, 0x01e);
+        Require((htileBase & 0x7000u) == 0, "HTILE base is not aligned to a metadata block");
+        depth.htilePipeXor = static_cast<std::uint32_t>((htileBase >> 8u) & 0xfu);
+        depth.htileSlice = view & 0x1fffu;
+        depth.htileAddress = (htileBase & ~0xf00ull) + depth.htileSlice * HtileSliceBytes(depth.extent);
         depth.htileStencil = stencil && (read(cx, 0x011) & (1u << 29u)) == 0;
     }
     result.depth = depth;

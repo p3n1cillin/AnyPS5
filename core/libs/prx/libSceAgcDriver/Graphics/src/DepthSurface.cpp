@@ -169,6 +169,9 @@ public:
     std::uint8_t clearStencil = 0;
     std::uint64_t htileAddress = 0;
     std::uint64_t htileGeneration = 0;
+    std::uint32_t htileSlice = 0;
+    std::uint32_t htilePipeXor = 0;
+    bool htileStencil = false;
 
     void ApplyFastClear() {
         const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
@@ -428,23 +431,33 @@ std::uint32_t expandedHtileWord(std::uint32_t word, bool stencilInHtile, VkImage
 
 void noteHtileWrites(DepthSurface& surface, const DepthTarget& target) {
     if (target.htileAddress == 0) return;
-    const auto tiles = static_cast<std::size_t>((target.extent.width + 7u) / 8u) * ((target.extent.height + 7u) / 8u);
-    const auto bytes = tiles * 4u;
+    const auto bytes = static_cast<std::size_t>(HtileSliceBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
-    if (surface.htileAddress == target.htileAddress && surface.htileGeneration != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, surface.htileGeneration)) return;
-    std::vector<std::uint32_t> words(tiles);
+    if (surface.htileAddress == target.htileAddress && surface.htileSlice == target.htileSlice && surface.htilePipeXor == target.htilePipeXor && surface.htileStencil == target.htileStencil && surface.htileGeneration != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, surface.htileGeneration)) return;
+    std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     surface.htileAddress = target.htileAddress;
     surface.htileGeneration = collected;
+    surface.htileSlice = target.htileSlice;
+    surface.htilePipeXor = target.htilePipeXor;
+    surface.htileStencil = target.htileStencil;
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
-    for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
+    const auto wordIndex = [&](std::uint32_t x, std::uint32_t y) { return static_cast<std::size_t>((HtileWordOffset(target.extent, x, y, target.htileSlice, target.htilePipeXor) % bytes) / 4u); };
+    for (std::uint32_t y = 0; y < target.extent.height; y += 8u) {
+        for (std::uint32_t x = 0; x < target.extent.width; x += 8u) cleared &= HtileFillClears(words[wordIndex(x, y)], target.htileStencil);
+    }
     if (cleared == 0) return;
     static const bool traceHtileClears = std::getenv("APS5_TRACE_HTILE_CLEARS") != nullptr;
     static std::atomic<std::uint32_t> tracedClears{0};
-    if (traceHtileClears && tracedClears.fetch_add(1, std::memory_order_relaxed) < 256u) std::fprintf(stderr, "[htile-clear] address=0x%llx extent=%ux%u bytes=%zu stencil=%u aspects=0x%x first=0x%08x\n", static_cast<unsigned long long>(target.htileAddress), target.extent.width, target.extent.height, bytes, target.htileStencil ? 1u : 0u, cleared, words.front());
+    if (traceHtileClears && tracedClears.fetch_add(1, std::memory_order_relaxed) < 256u) std::fprintf(stderr, "[htile-clear] address=0x%llx extent=%ux%u bytes=%zu stencil=%u aspects=0x%x first=0x%08x\n", static_cast<unsigned long long>(target.htileAddress), target.extent.width, target.extent.height, bytes, target.htileStencil ? 1u : 0u, cleared, words[wordIndex(0, 0)]);
     surface.pendingClear |= cleared;
-    for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
+    for (std::uint32_t y = 0; y < target.extent.height; y += 8u) {
+        for (std::uint32_t x = 0; x < target.extent.width; x += 8u) {
+            auto& word = words[wordIndex(x, y)];
+            word = expandedHtileWord(word, target.htileStencil, cleared);
+        }
+    }
     GuestMemory::Write(target.htileAddress, std::as_bytes(std::span(words)), 4);
     surface.htileGeneration = GuestMemory::CollectWrites(target.htileAddress, bytes);
 }
@@ -457,6 +470,26 @@ std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
     const auto width = static_cast<std::uint64_t>((extent.width + blockWidth - 1) / blockWidth * blockWidth);
     const auto height = static_cast<std::uint64_t>((extent.height + blockHeight - 1) / blockHeight * blockHeight);
     return width * height * bytesPerTexel;
+}
+
+std::uint64_t HtileSliceBytes(VkExtent2D extent) {
+    Require(extent.width != 0 && extent.width <= 16384u && extent.height != 0 && extent.height <= 16384u, "HTILE extent is outside the depth target limits");
+    return static_cast<std::uint64_t>((extent.width + 1023u) / 1024u) * ((extent.height + 511u) / 512u) * 32768u;
+}
+
+std::uint64_t HtileWordOffset(VkExtent2D extent, std::uint32_t x, std::uint32_t y, std::uint32_t slice, std::uint32_t pipeXor) {
+    const auto sliceBytes = HtileSliceBytes(extent);
+    Require(x < extent.width && y < extent.height && slice <= 8191u && pipeXor <= 15u, "HTILE coordinate, slice or pipe XOR is out of range");
+    const std::array<std::uint32_t, 15> bits{
+        0u, 0u, (x >> 3u) & 1u, (y >> 4u) & 1u, (x >> 6u) & 1u, (y >> 6u) & 1u, (x >> 7u) & 1u, (y >> 7u) & 1u,
+        ((x >> 3u) ^ (y >> 3u) ^ (slice >> 3u)) & 1u, ((slice >> 2u) ^ (x >> 4u) ^ (y >> 4u)) & 1u,
+        ((slice >> 1u) ^ (y >> 5u) ^ (x >> 6u)) & 1u, (slice ^ (x >> 5u) ^ (y >> 6u)) & 1u,
+        (x >> 8u) & 1u, (y >> 8u) & 1u, (x >> 9u) & 1u
+    };
+    std::uint32_t offset = 0;
+    for (std::uint32_t bit = 0; bit < bits.size(); ++bit) offset |= bits[bit] << bit;
+    const auto block = static_cast<std::uint64_t>(y / 512u) * ((extent.width + 1023u) / 1024u) + x / 1024u;
+    return slice * sliceBytes + block * 32768u + (offset ^ (pipeXor << 8u));
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
@@ -586,18 +619,19 @@ VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile) {
 }
 
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes) {
-    if (htile == 0 || htile < address || htile >= address + bytes) return false;
-    const auto tiles = static_cast<std::uint64_t>((extent.width + 7u) / 8u) * ((extent.height + 7u) / 8u);
-    return address + bytes - htile >= tiles * 4u;
+    if (htile == 0 || htile < address || htile - address > bytes) return false;
+    return bytes - (htile - address) >= HtileSliceBytes(extent);
 }
 
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         const auto& target = surface->target;
-        if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;
-        const VkImageAspectFlags written = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
-        surface->pendingClear = (surface->pendingClear & ~written) | HtileFillClears(pattern, target.htileStencil);
+        const auto htile = surface->htileAddress != 0 ? surface->htileAddress : target.htileAddress;
+        const auto stencilInHtile = surface->htileAddress != 0 ? surface->htileStencil : target.htileStencil;
+        if (!HtileFillCovers(htile, target.extent, address, bytes)) continue;
+        const VkImageAspectFlags written = VK_IMAGE_ASPECT_DEPTH_BIT | (stencilInHtile ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        surface->pendingClear = (surface->pendingClear & ~written) | HtileFillClears(pattern, stencilInHtile);
     }
 }
 
