@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <exception>
+#include <sstream>
 
 namespace AgcDriver::Graphics {
 
@@ -47,7 +48,23 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
         }
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory buffer");
+        const auto allocationResult = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+        if (allocationResult != VK_SUCCESS) {
+            const auto& memoryType = context.memory.memoryTypes[allocation.memoryTypeIndex];
+            const auto heap = memoryType.heapIndex;
+            std::ostringstream operation;
+            operation << "vkAllocateMemory buffer (bytes=" << size << " capacity=" << capacity << " allocation=" << allocation.allocationSize << " type=" << allocation.memoryTypeIndex << " heap=" << heap << " heap-size=" << context.memory.memoryHeaps[heap].size << " allocation-limit=" << context.limits.maxMemoryAllocationCount << " usage=0x" << std::hex << this->usage << " requested-properties=0x" << properties << " actual-properties=0x" << memoryType.propertyFlags << std::dec;
+            if (context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                VkPhysicalDeviceMemoryProperties2 memoryProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+                context.memoryProperties2(context.physical, &memoryProperties);
+                operation << " heap-budget=" << budget.heapBudget[heap] << " heap-usage=" << budget.heapUsage[heap];
+            } else {
+                operation << " heap-budget=unavailable heap-usage=unavailable";
+            }
+            operation << ')';
+            Check(allocationResult, operation.str().c_str());
+        }
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");

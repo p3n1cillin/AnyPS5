@@ -33,6 +33,7 @@ struct MockDevice {
     std::uint64_t destroyedBuffers = 0;
     VkDeviceSize liveBytes = 0;
     std::map<VkDeviceMemory, VkDeviceSize> memoryBytes;
+    VkResult allocationResult = VK_SUCCESS;
 };
 
 MockDevice mock;
@@ -49,6 +50,7 @@ VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer bu
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
+    if (mock.allocationResult != VK_SUCCESS) return mock.allocationResult;
     *memory = reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(mock.next++));
     if (info->memoryTypeIndex == 1) mock.hostMemory[*memory].resize(info->allocationSize);
     mock.memoryBytes[*memory] = info->allocationSize;
@@ -244,6 +246,37 @@ void SmallDeviceClasses() {
     Expect(nextArgs.Handle() == tiny && mock.allocations == made, "a 20-byte device request did not reuse the retained 256-byte buffer of its class");
 }
 
+VKAPI_ATTR void VKAPI_CALL mockMemoryBudget(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
+    auto* budget = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(properties->pNext);
+    budget->heapBudget[1] = 8 * MiB;
+    budget->heapUsage[1] = 7 * MiB;
+}
+
+void AllocationFailure() {
+    for (const bool reported : {false, true}) {
+        mock = MockDevice{};
+        mock.allocationResult = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        auto context = mockContext();
+        context.memory.memoryHeapCount = 2;
+        context.memory.memoryTypes[1].heapIndex = 1;
+        context.memory.memoryHeaps[1].size = 16 * MiB;
+        context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{1});
+        if (reported) context.memoryProperties2 = mockMemoryBudget;
+        bool rejected = false;
+        try {
+            Buffer buffer(context, 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        } catch (const std::runtime_error& error) {
+            rejected = true;
+            const std::string message = error.what();
+            Expect(message.find("Vulkan result -2") != std::string::npos, "an allocation failure lost the original Vulkan result");
+            Expect(message.find("bytes=20 capacity=256 allocation=256 type=1 heap=1") != std::string::npos, "an allocation failure lost its requested and actual allocation sizes or selected heap");
+            const auto budget = reported ? "heap-budget=8388608 heap-usage=7340032" : "heap-budget=unavailable heap-usage=unavailable";
+            Expect(message.find(budget) != std::string::npos, "an allocation failure misreported the heap budget");
+        }
+        Expect(rejected && mock.destroyedBuffers == 1 && mock.allocations == 0 && mock.frees == 0, "an allocation failure leaked its buffer or freed memory that was never allocated");
+    }
+}
+
 }
 
 int main() {
@@ -254,6 +287,7 @@ int main() {
         Budget();
         AddressAndHostUnchanged();
         SmallDeviceClasses();
+        AllocationFailure();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
