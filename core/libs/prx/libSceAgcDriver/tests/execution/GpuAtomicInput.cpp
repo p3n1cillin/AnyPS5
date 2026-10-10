@@ -74,7 +74,7 @@ struct GuestBlock {
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, Size);
 #endif
             Require(AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(data), Size), "GPU capture guest block is not tracked");
-            GuestAllocations::Mutation().Add(data, Size, true, true);
+            GuestAllocations::Mutation().Add(data, Size, true, true, true);
         }
         ~GuestBlock() {
             GuestAllocations::Mutation().Remove(data);

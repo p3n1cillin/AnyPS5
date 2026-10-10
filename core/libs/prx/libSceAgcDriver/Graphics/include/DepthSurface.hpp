@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <span>

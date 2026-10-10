@@ -459,7 +459,7 @@ void Run(const Context& context) {
 
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(const_cast<std::uint8_t*>(memory), 2 * Block, true, true);
+        mutation.Add(const_cast<std::uint8_t*>(memory), 2 * Block, true, true, true);
     }
     StorageRoundTrip(context, watched + Block);
     ColorStorageWriter(context, watched + Block);

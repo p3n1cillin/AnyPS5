@@ -181,7 +181,18 @@ void Run(AgcDriver::VulkanDevice& device) {
     Reject(device, narrowAddress, Texture(8u, 77u));
     auto partialStore = Store;
     partialStore[12] = 0xf0200108u;
-    Reject(device, partialStore, Texture(8u, 77u));
+    Fill(8u, 4u);
+    auto expected = Texels;
+    Input[0] = 2u;
+    Input[1] = 0xffffffffu;
+    expected[8] = std::bit_cast<std::uint32_t>(1.0f);
+    expected[9] = expected[10] = expected[11] = 0u;
+    const auto shader = Compile(device, partialStore, Texture(8u, 77u), 1u);
+    device.Dispatch(shader, 1u, 1u, 1u);
+    device.WaitIdle();
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(Texels.data()), 8u * 4u * 4u, nullptr, "test");
+    device.WaitIdle();
+    Require(Texels == expected, "a partial 2D store to a 1D image did not ignore y and zero omitted components");
     auto mipStore = Store;
     mipStore[12] += 0x00040000u;
     Reject(device, mipStore, Texture(8u, 77u));
@@ -204,7 +215,7 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        GuestAllocations::Mutation().Add(Texels.data(), sizeof(Texels), true, true);
+        GuestAllocations::Mutation().Add(Texels.data(), sizeof(Texels), true, true, true);
         Run(*device);
         GuestAllocations::Mutation().Remove(Texels.data());
         std::cout << "2D accesses to measured 1D image interfaces passed\n";
