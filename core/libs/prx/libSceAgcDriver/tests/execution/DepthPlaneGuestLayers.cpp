@@ -47,6 +47,8 @@ PFN_vkCmdCopyBufferToImage realCopyBufferToImage = nullptr;
 PFN_vkBeginCommandBuffer realBeginCommandBuffer = nullptr;
 VkImage planeImage = VK_NULL_HANDLE;
 bool rejectNextBegin = false;
+std::uint64_t queuedLabelAddress = 0;
+std::uint32_t queuedLabelCalls = 0;
 std::atomic<std::uint32_t> imageToBufferCopies{0};
 std::atomic<std::uint32_t> bufferToImageCopies{0};
 
@@ -263,7 +265,7 @@ void FillLayer(std::uint8_t* layer, float depth) {
     for (std::size_t offset = 0; offset < LayerBytes; offset += sizeof(depth)) std::memcpy(layer + offset, &depth, sizeof(depth));
 }
 
-void ExpectPlane(const Context& context, float resident, float guest) {
+void ExpectPlane(const Context& context, float resident, float guest, std::optional<float> changedGuest = std::nullopt) {
     Require(planeImage != VK_NULL_HANDLE, "the test did not capture the depth array image");
     Buffer pixels(context, BlockBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     CommandBatch batch(context);
@@ -274,11 +276,27 @@ void ExpectPlane(const Context& context, float resident, float guest) {
     context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), planeImage, VK_IMAGE_LAYOUT_GENERAL, pixels.Handle(), 1, &region);
     batch.SubmitAndWait();
     pixels.Invalidate();
+    std::size_t changedPixels = 0;
     for (std::size_t offset = 0; offset < BlockBytes; offset += sizeof(float)) {
         float actual;
         std::memcpy(&actual, pixels.Bytes().data() + offset, sizeof(actual));
+        if (offset >= LayerBytes && changedGuest && actual == *changedGuest) {
+            ++changedPixels;
+            continue;
+        }
         Require(actual == (offset < LayerBytes ? resident : guest), "the reused depth array contains stale or discarded pixels");
     }
+    Require(!changedGuest || changedPixels == 1, "the queued label did not change exactly one depth texel");
+}
+
+void StoreQueuedDepthLabel() {
+    Require(queuedLabelAddress != 0, "the depth label recorder has no queued address");
+    const auto address = queuedLabelAddress;
+    queuedLabelAddress = 0;
+    Recorder::ForgetQueuedLabels();
+    const std::array<float, 1> value{0.5f};
+    AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span(value)), 4);
+    ++queuedLabelCalls;
 }
 
 void Run(const Context& base, const WatchedBlock& block) {
@@ -416,6 +434,36 @@ void RunStorageWrite(const Context& base, const WatchedBlock& block) {
     recorder.Sync();
     ExpectPlane(base, 1.0f, 0.75f);
     storage.reset();
+    Require(DepthSurfaceTexture(context, words, resource, identity) != nullptr, "the stored depth array was not sampled again");
+    recorder.Sync();
+    bufferToImageCopies = 0;
+    Require(DepthSurfaceTexture(context, words, resource, identity) != nullptr && bufferToImageCopies == 0, "the stored depth array did not establish a reuse proof");
+    const std::array<float, 1> label{0.5f};
+    queuedLabelAddress = written.baseAddress;
+    queuedLabelCalls = 0;
+    Recorder::SetQueuedLabelRecorder(&StoreQueuedDepthLabel);
+    Recorder::NoteQueuedLabel(queuedLabelAddress, std::as_bytes(std::span(label)), 1, AgcDriver::GuestMemory::GpuLockThreadTag());
+    try {
+        Require(!Recorder::SnapshotWriteOverlaps(written.baseAddress, LayerBytes), "the queued depth label unexpectedly has a recorded write");
+        Require(DepthSurfaceTexture(context, words, resource, identity) != nullptr, "the depth array was not sampled after its queued label");
+        Require(queuedLabelCalls == 1 && queuedLabelAddress == 0, "the reused depth layer bypassed its preceding queued label write");
+        recorder.Sync();
+        ExpectPlane(base, 1.0f, 0.75f, 0.5f);
+        Require(DepthSurfaceTexture(context, words, resource, identity) != nullptr, "the labeled depth array did not refresh its proof");
+        recorder.Sync();
+        queuedLabelAddress = block.Address() + BlockBytes;
+        Recorder::NoteQueuedLabel(queuedLabelAddress, std::as_bytes(std::span(label)), 2, AgcDriver::GuestMemory::GpuLockThreadTag());
+        bufferToImageCopies = 0;
+        Require(DepthSurfaceTexture(context, words, resource, identity) != nullptr && bufferToImageCopies == 0 && queuedLabelCalls == 1, "a non-overlapping queued label invalidated the depth layer");
+    } catch (...) {
+        Recorder::ForgetQueuedLabels();
+        Recorder::SetQueuedLabelRecorder(nullptr);
+        queuedLabelAddress = 0;
+        throw;
+    }
+    Recorder::ForgetQueuedLabels();
+    Recorder::SetQueuedLabelRecorder(nullptr);
+    queuedLabelAddress = 0;
 }
 
 }
