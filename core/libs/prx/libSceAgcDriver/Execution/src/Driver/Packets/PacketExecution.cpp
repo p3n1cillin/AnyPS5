@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -10,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
+#include <cstdio>
 #include <functional>
 #include <shared_mutex>
 #include <sstream>
@@ -299,6 +302,34 @@ void Driver::execute(const Submission& submission) {
                         dumpBank("user-config", queue.userConfig);
                         const auto text = state.str();
                         std::fprintf(stderr, "%s", text.c_str());
+                    }
+                    static const bool dumpRejectedPrograms = std::getenv("APS5_DUMP_REJECTED_DRAW_PROGRAMS") != nullptr;
+                    if (dumpRejectedPrograms) {
+                        try {
+                            const auto localDevice = device.Load();
+                            require(localDevice != nullptr, "rejected draw has no device profile");
+                            DrawDecode decoded{};
+                            decoded.state.stages = Graphics::DecodeShaderStages(queue);
+                            DecodeGraphicsPrograms(decoded, queue, *submission.shaders, false, false);
+                            for (const auto& program : decoded.programs) {
+                                ShaderRecompiler::RecompileRequest request{
+                                    program.binary,
+                                    {decoded.state.stages.vertexWaveSize, program.firstUserSgpr, program.userData, std::nullopt, std::nullopt, std::nullopt, program.memory, RegisteredFloatMode(*program.snapshot)},
+                                    localDevice->Target(), {0, 0, 0, Graphics::PipelinePushConstantBytes},
+                                    ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, {}, decoded.state.stages.mesh, decoded.state.stages.tessellation, {}}
+                                };
+                                const auto serialized = ShaderRecompiler::RequestSerializer{}.Serialize(request);
+                                const auto file = "rejected_draw_" + std::to_string(submission.serial) + "_" + std::to_string(program.binary.codeAddress) + ".req";
+                                auto* output = std::fopen(file.c_str(), "wb");
+                                require(output != nullptr, "cannot open rejected draw program dump");
+                                const bool written = std::fwrite(serialized.data(), 1, serialized.size(), output) == serialized.size();
+                                const bool closed = std::fclose(output) == 0;
+                                require(written && closed, "cannot write rejected draw program dump");
+                                std::fprintf(stderr, "[draw-rejected-program] address=0x%llx stage=%u code-words=%zu user-words=%zu register-only=1 request=%s\n", static_cast<unsigned long long>(program.binary.codeAddress), static_cast<unsigned>(program.binary.stage), program.binary.code.size(), program.userData.size(), file.c_str());
+                            }
+                        } catch (const std::exception& dumpError) {
+                            std::fprintf(stderr, "[draw-rejected-program] capture failed: %s\n", dumpError.what());
+                        }
                     }
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
