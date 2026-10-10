@@ -1316,6 +1316,10 @@ void Recorder::SetQueuedLabelRecorder(void (*recorder)()) {
     queuedLabelRecorder.store(recorder, std::memory_order_release);
 }
 
+bool Recorder::QueuedLabelWriteOverlaps(std::uint64_t address, std::size_t bytes) {
+    return bytes != 0 && QueuedLabelOverlaps(address, bytes);
+}
+
 Recorder::StoreStatistics Recorder::StoreCounts() {
     return StoreStatistics{storeCount.load(std::memory_order_relaxed), storeRuns.load(std::memory_order_relaxed), storesJoined.load(std::memory_order_relaxed), storesReplaced.load(std::memory_order_relaxed), storeWawBarriers.load(std::memory_order_relaxed), storeJoinsRefused.load(std::memory_order_relaxed), queuedLabelsNoted.load(std::memory_order_relaxed), queuedLabelsOverRecorded.load(std::memory_order_relaxed), queuedLabelHits.load(std::memory_order_relaxed), queuedLabelHookRecords.load(std::memory_order_relaxed), queuedLabelHookInCompletion.load(std::memory_order_relaxed), keyStoreCount.load(std::memory_order_relaxed), keyStoreRuns.load(std::memory_order_relaxed), keyStoreRunsForWriter.load(std::memory_order_relaxed), keyStoresJoined.load(std::memory_order_relaxed), storeRunsAtSubmit.load(std::memory_order_relaxed), storeRunsForced.load(std::memory_order_relaxed)};
 }
