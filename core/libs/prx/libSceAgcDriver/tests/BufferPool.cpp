@@ -39,6 +39,10 @@ struct MockDevice {
     VkDeviceSize liveHostBytes = 0;
     VkDeviceSize maxHostBytes = std::numeric_limits<VkDeviceSize>::max();
     VkResult budgetFailure = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    std::uint32_t memoryTypeBits = 3;
+    std::vector<std::uint32_t> allocationTypes;
+    std::vector<VkMemoryAllocateFlags> allocationFlags;
+    std::map<VkDeviceMemory, std::uint32_t> memoryTypes;
 };
 
 MockDevice mock;
@@ -51,18 +55,21 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateBuffer(VkDevice, const VkBufferCreateIn
 }
 
 VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer buffer, VkMemoryRequirements* requirements) {
-    *requirements = {mock.sizes.at(buffer), 256, 3};
+    *requirements = {mock.sizes.at(buffer), 256, mock.memoryTypeBits};
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
     ++mock.allocationAttempts;
+    mock.allocationTypes.push_back(info->memoryTypeIndex);
+    mock.allocationFlags.push_back(info->pNext == nullptr ? 0 : static_cast<const VkMemoryAllocateFlagsInfo*>(info->pNext)->flags);
     if (mock.allocationResult != VK_SUCCESS) return mock.allocationResult;
     if (info->memoryTypeIndex == 1 && mock.liveHostBytes + info->allocationSize > mock.maxHostBytes) return mock.budgetFailure;
     *memory = reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(mock.next++));
-    if (info->memoryTypeIndex == 1) {
+    if (info->memoryTypeIndex != 0) {
         mock.hostMemory[*memory].resize(info->allocationSize);
-        mock.liveHostBytes += info->allocationSize;
+        if (info->memoryTypeIndex == 1) mock.liveHostBytes += info->allocationSize;
     }
+    mock.memoryTypes[*memory] = info->memoryTypeIndex;
     mock.memoryBytes[*memory] = info->allocationSize;
     mock.liveBytes += info->allocationSize;
     ++mock.allocations;
@@ -85,7 +92,8 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyBuffer(VkDevice, VkBuffer, const VkAllocat
 }
 
 VKAPI_ATTR void VKAPI_CALL mockFreeMemory(VkDevice, VkDeviceMemory memory, const VkAllocationCallbacks*) {
-    if (mock.hostMemory.contains(memory)) mock.liveHostBytes -= mock.memoryBytes.at(memory);
+    if (mock.memoryTypes.at(memory) == 1) mock.liveHostBytes -= mock.memoryBytes.at(memory);
+    mock.memoryTypes.erase(memory);
     mock.liveBytes -= mock.memoryBytes.at(memory);
     mock.memoryBytes.erase(memory);
     mock.hostMemory.erase(memory);
@@ -335,6 +343,81 @@ void PersistentAllocationFailure() {
     }
 }
 
+Context alternateHeapContext() {
+    auto context = mockContext();
+    context.memory.memoryHeapCount = 2;
+    context.memory.memoryTypeCount = 3;
+    context.memory.memoryTypes[2] = {HostVisible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1};
+    return context;
+}
+
+void AlternateHostHeap() {
+    for (const auto failure : {VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY}) {
+        for (const bool reclaim : {false, true}) {
+            mock = MockDevice{};
+            mock.memoryTypeBits = 7;
+            mock.budgetFailure = failure;
+            auto context = alternateHeapContext();
+            Buffer live(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            live.Bytes().front() = std::byte{0x42};
+            if (reclaim) {
+                Buffer unused(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            }
+            mock.maxHostBytes = 4 * MiB;
+            const auto attempts = mock.allocationAttempts;
+            const auto expected = reclaim ? 3u : 2u;
+            VkBuffer handle = VK_NULL_HANDLE;
+            constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            {
+                Buffer recovered(context, 9 * MiB, usage);
+                handle = recovered.Handle();
+                recovered.Bytes().front() = std::byte{0x73};
+                recovered.Bytes().back() = std::byte{0x39};
+                Expect(mock.allocationAttempts == attempts + expected && mock.allocationTypes.back() == 2, "host pressure did not try one compatible alternate heap after checking unused memory");
+                Expect(live.Bytes().front() == std::byte{0x42} && recovered.Bytes().size() == 9 * MiB && recovered.DeviceAddress() != 0 && mock.allocationFlags.back() == VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, "alternate-heap recovery altered a live buffer, mapping or device address");
+            }
+            Buffer reused(context, 9 * MiB, usage);
+            Expect(reused.Handle() == handle && mock.allocationAttempts == attempts + expected && reused.Bytes().front() == std::byte{0x73} && reused.Bytes().back() == std::byte{0x39}, "an alternate-heap allocation was not retained and reused intact");
+        }
+    }
+}
+
+void AlternateHostHeapGuards() {
+    for (unsigned control = 0; control < 10; ++control) {
+        mock = MockDevice{};
+        mock.memoryTypeBits = 7;
+        mock.maxHostBytes = 0;
+        auto context = alternateHeapContext();
+        auto properties = HostVisible;
+        if (control == 0) mock.memoryTypeBits = 3;
+        if (control == 1) context.memory.memoryTypes[2].heapIndex = 0;
+        if (control == 2) context.memory.memoryTypes[2].propertyFlags &= ~VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if (control == 3) context.memory.memoryTypes[2].propertyFlags &= ~VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+        if (control == 4) properties |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        if (control == 5) mock.allocationResult = VK_ERROR_DEVICE_LOST;
+        if (control == 6) properties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        if (control == 6 || control == 7) mock.allocationResult = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (control == 7) {
+            context.memory.memoryHeapCount = 3;
+            context.memory.memoryTypeCount = 4;
+            context.memory.memoryTypes[3] = {HostVisible, 2};
+            mock.memoryTypeBits = 15;
+        }
+        if (control == 8) context.memory.memoryTypes[2].propertyFlags |= VK_MEMORY_PROPERTY_PROTECTED_BIT;
+        if (control == 9) context.memory.memoryTypes[2].propertyFlags |= VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD;
+        bool rejected = false;
+        try {
+            Buffer buffer(context, 20, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, properties);
+        } catch (const std::runtime_error& error) {
+            rejected = true;
+            const auto result = control == 5 ? VK_ERROR_DEVICE_LOST : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            Expect(std::string(error.what()).find("Vulkan result " + std::to_string(result)) != std::string::npos, "alternate-heap failure lost the Vulkan result");
+        }
+        const auto expected = control == 7 ? 2u : 1u;
+        Expect(rejected && mock.allocationAttempts == expected && mock.destroyedBuffers == 1 && mock.allocations == 0, "alternate-heap recovery ignored compatibility, retried a non-memory failure or leaked a failed buffer: control " + std::to_string(control));
+    }
+}
+
 }
 
 int main() {
@@ -348,6 +431,8 @@ int main() {
         AllocationFailure();
         AllocationPressure();
         PersistentAllocationFailure();
+        AlternateHostHeap();
+        AlternateHostHeapGuards();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

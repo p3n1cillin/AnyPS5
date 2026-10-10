@@ -60,6 +60,20 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 std::fprintf(stderr, "[buffer-memory] bytes=%llu released-unused-host=%llu retry-result=%d\n", static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(releasedHostBytes), static_cast<int>(allocationResult));
             }
         }
+        if ((allocationResult == VK_ERROR_OUT_OF_HOST_MEMORY || allocationResult == VK_ERROR_OUT_OF_DEVICE_MEMORY) && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            const auto exhaustedType = allocation.memoryTypeIndex;
+            const auto exhaustedHeap = context.memory.memoryTypes[exhaustedType].heapIndex;
+            constexpr VkMemoryPropertyFlags ordinaryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+            for (std::uint32_t type = 0; type < context.memory.memoryTypeCount; ++type) {
+                const auto& candidate = context.memory.memoryTypes[type];
+                if ((requirements.memoryTypeBits & (1u << type)) == 0 || candidate.heapIndex == exhaustedHeap || (candidate.propertyFlags & properties) != properties || (candidate.propertyFlags & ~ordinaryProperties) != 0) continue;
+                allocation.memoryTypeIndex = type;
+                memory = VK_NULL_HANDLE;
+                allocationResult = allocateMemory(context.device, &allocation, nullptr, &memory);
+                std::fprintf(stderr, "[buffer-memory] bytes=%llu exhausted-type=%u alternate-type=%u alternate-heap=%u alternate-result=%d\n", static_cast<unsigned long long>(allocation.allocationSize), exhaustedType, type, candidate.heapIndex, static_cast<int>(allocationResult));
+                break;
+            }
+        }
         if (allocationResult != VK_SUCCESS) {
             const auto& memoryType = context.memory.memoryTypes[allocation.memoryTypeIndex];
             const auto heap = memoryType.heapIndex;
