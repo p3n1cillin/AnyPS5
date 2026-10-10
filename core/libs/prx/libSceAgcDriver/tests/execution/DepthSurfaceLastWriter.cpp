@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -137,6 +138,13 @@ constexpr std::size_t Block = 65536;
 
 PFN_vkGetDeviceProcAddr uploadResolver = nullptr;
 std::uint32_t newDepthUploads = 0;
+VkBuffer depthStaging = VK_NULL_HANDLE;
+PFN_vkCmdCopyBufferToImage copyDepthImage = nullptr;
+
+VKAPI_ATTR void VKAPI_CALL captureDepthCopy(VkCommandBuffer commands, VkBuffer buffer, VkImage image, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    if (count == 2) depthStaging = buffer;
+    copyDepthImage(commands, buffer, image, layout, count, regions);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL refuseDepthUpload(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* callbacks, VkBuffer* buffer) {
     if (info->size == Block && info->usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
@@ -148,6 +156,7 @@ VKAPI_ATTR VkResult VKAPI_CALL refuseDepthUpload(VkDevice device, const VkBuffer
 
 PFN_vkVoidFunction VKAPI_CALL depthUploadProc(VkDevice device, const char* name) {
     if (std::string_view(name) == "vkCreateBuffer") return reinterpret_cast<PFN_vkVoidFunction>(refuseDepthUpload);
+    if (std::string_view(name) == "vkCmdCopyBufferToImage") return reinterpret_cast<PFN_vkVoidFunction>(captureDepthCopy);
     return uploadResolver(device, name);
 }
 
@@ -288,7 +297,7 @@ void ColorStorageWriter(const Context& context, std::uint64_t address) {
     ClearCachedTextures(context.device);
 }
 
-void DepthArraySharedPool(const Context& context) {
+void DepthArraySharedPool(const Context& context, bool recorded) {
     alignas(256) static std::array<std::uint32_t, 2 * Block / 4> depth;
     depth.fill(0x3e800000);
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -303,20 +312,49 @@ void DepthArraySharedPool(const Context& context) {
         Buffer unused(configured, Block, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
     uploadResolver = context.deviceProc;
+    copyDepthImage = context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
     newDepthUploads = 0;
+    depthStaging = VK_NULL_HANDLE;
     configured.deviceProc = depthUploadProc;
     auto resource = View(extent.width, extent.height, address);
     resource.dimension = TextureDimension::k2DArray;
     resource.depthOrLastArray = 1;
     resource.tileMode = TextureTileMode::kZ64KBX;
+    std::unique_ptr<Recorder> recorder;
+    if (recorded) {
+        recorder = std::make_unique<Recorder>(configured);
+        configured.recorder = recorder.get();
+        recorder->Activate();
+    }
     try {
         const auto sampled = Sample(configured, resource);
         Require(sampled != nullptr && sampled->View() != VK_NULL_HANDLE && sampled->SampledViewRange(false).type == VK_IMAGE_VIEW_TYPE_2D_ARRAY && sampled->SampledViewRange(false).layers == VK_REMAINING_ARRAY_LAYERS && sampled->RefreshedPerUse(), "a mixed resident/guest depth array did not produce its refreshed array view");
         Require(newDepthUploads == 0, "a depth array upload ignored the caller's reusable host buffer");
+        if (recorder != nullptr) {
+            recorder->Submit();
+            Require(recorder->InFlightKeptBytes() == Block, "a recorded depth array omitted its guest upload from the kept-byte budget");
+            recorder->Sync();
+            Require(recorder->InFlightKeptBytes() == 0, "a completed depth array retained its upload byte count");
+        }
+        Require(depthStaging != VK_NULL_HANDLE, "the mixed depth array did not copy its linear staging buffer");
+        Buffer pixels(context, 2 * Block, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy region{0, 0, 2 * Block};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(batch.Handle(), depthStaging, pixels.Handle(), 1, &region);
+        batch.SubmitAndWait();
+        pixels.Invalidate();
+        for (std::size_t offset = 0; offset < pixels.Bytes().size(); offset += sizeof(float)) {
+            float actual;
+            std::memcpy(&actual, pixels.Bytes().data() + offset, sizeof(actual));
+            Require(actual == (offset < Block ? 1.0f : 0.25f), "the mixed resident/guest depth array changed a layer's pixels");
+        }
     } catch (...) {
+        recorder.reset();
         ClearDepthSurfaces(context.device);
         throw;
     }
+    recorder.reset();
     ClearDepthSurfaces(context.device);
 }
 
@@ -483,7 +521,8 @@ int main() {
         }
         Run(device->GetContext());
         ResummarizeStorageWriter(device->GetContext());
-        DepthArraySharedPool(device->GetContext());
+        DepthArraySharedPool(device->GetContext(), false);
+        DepthArraySharedPool(device->GetContext(), true);
         std::puts("depth surface last writer tests passed");
         return 0;
     } catch (const std::exception& error) {

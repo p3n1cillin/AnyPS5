@@ -336,7 +336,7 @@ public:
                 context.detiler->Dispatch(commands, resource.tileMode, format == VK_FORMAT_D32_SFLOAT ? 4u : 2u, uploads[next++]->Handle(), 0, staging->Handle(), geometry.LinearLayerOffset(layer), geometry.mips.front(), false, layer, geometry.thick);
             }
             if (recorder != nullptr) {
-                for (auto& upload : uploads) recorder->Keep(upload);
+                for (auto& upload : uploads) recorder->Keep(upload, upload->Bytes().size());
             }
         }
         VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
