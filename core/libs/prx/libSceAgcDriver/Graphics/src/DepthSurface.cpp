@@ -5,8 +5,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -24,6 +26,8 @@
 
 namespace AgcDriver::Graphics {
 namespace {
+
+std::uint64_t depthWrites = 0;
 
 class DepthSurface {
 public:
@@ -125,6 +129,7 @@ public:
     std::weak_ptr<StorageTexture> writer;
     const StorageTexture* seeded = nullptr;
     std::uint32_t writerLayer = 0;
+    std::uint64_t written = ++depthWrites;
 
     bool StorageFormatAccepts(VkFormat format) const {
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
@@ -141,6 +146,7 @@ public:
             std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), descriptor.width, descriptor.height, static_cast<int>(storageFormat), static_cast<int>(descriptor.dimension), descriptor.mipCount);
             throw std::runtime_error(text);
         }
+        if (!into) written = ++depthWrites;
         if (transferBuffer == nullptr) transferBuffer = std::make_unique<DeviceBuffer>(context, static_cast<std::size_t>(target.extent.width) * target.extent.height * (d16 ? 2u : 4u), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         auto* recorder = Recorder::Active();
         std::unique_ptr<CommandBatch> batch;
@@ -180,6 +186,7 @@ public:
         const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
         pendingClear = 0;
         if (aspects == 0) return;
+        written = ++depthWrites;
         writer.reset();
         seeded = nullptr;
         auto* recorder = Recorder::Active();
@@ -262,9 +269,14 @@ private:
     }
 };
 
+struct DepthPlaneSlice {
+    VkImage image = VK_NULL_HANDLE;
+    std::uint64_t written = 0;
+};
+
 class DepthPlaneCopy {
 public:
-    DepthPlaneCopy(const Context& context, VkExtent2D extent, VkFormat format, std::uint32_t layers) : context(context), extent(extent), format(format), layers(layers) {
+    DepthPlaneCopy(const Context& context, VkExtent2D extent, VkFormat format, std::uint32_t layers) : context(context), extent(extent), format(format), layers(layers), guestLayers(layers), surfaceLayers(layers) {
         this->context.bufferPool.reset();
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.flags = layers % 6u == 0 && extent.width == extent.height ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
@@ -297,18 +309,39 @@ public:
     DepthPlaneCopy(const DepthPlaneCopy&) = delete;
     DepthPlaneCopy& operator=(const DepthPlaneCopy&) = delete;
 
-    std::shared_ptr<Texture> Refresh(const Context& uploadContext, std::span<const VkImage> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
+    std::shared_ptr<Texture> Refresh(const Context& uploadContext, std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
         PerformanceTimer timing("DepthPlaneCopy.Refresh");
         Require(uploadContext.device == context.device, "depth plane upload belongs to another device");
         Require(slices.size() == layers, "depth plane copy slices do not match its layers");
         const auto geometry = DescribeSurface(resource);
         Require(geometry.layers == layers && geometry.sliceLinearBytes == sliceBytes() && !geometry.mips.empty(), "depth plane copy geometry does not match its layers");
         std::vector<std::shared_ptr<Buffer>> uploads;
+        std::vector<std::uint32_t> uploadLayers;
+        std::vector<std::uint32_t> copiedLayers;
+        auto nextGuestLayers = guestLayers;
+        auto nextSurfaceLayers = surfaceLayers;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            if (slices[layer] != VK_NULL_HANDLE) continue;
+            auto& held = nextGuestLayers[layer];
+            auto& surface = nextSurfaceLayers[layer];
+            if (slices[layer].image != VK_NULL_HANDLE) {
+                held = {};
+                if (slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) continue;
+                surface = slices[layer];
+                copiedLayers.push_back(layer);
+                continue;
+            }
+            surface = {};
+            const GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes)), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), resource.mipCount, StorageTexture::PendingSerial()};
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{current.address, current.address + current.bytes}}};
+            if (held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && held.mappingGeneration == current.mappingGeneration && held.mipCount == current.mipCount && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation) && (held.pendingSerial == current.pendingSerial || (!StorageTexture::AnyPendingOverlaps(range) && !AnyShadowedOverlaps(range)))) {
+                held = current;
+                continue;
+            }
             auto upload = std::make_shared<Buffer>(uploadContext, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            GuestMemory::ReadCommitted(resource.baseAddress + geometry.GuestLayerOffset(layer), upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
+            GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
             uploads.push_back(std::move(upload));
+            uploadLayers.push_back(layer);
+            held = current;
         }
         const auto uploadedBytes = geometry.layerBytes * uploads.size();
         timing.Mark("guest_upload", uploadedBytes);
@@ -319,64 +352,9 @@ public:
             tracedUploads = uploads.size();
             if (tracedShapes.fetch_add(1, std::memory_order_relaxed) < 256u) std::fprintf(stderr, "[depth-plane-copy] address=0x%llx extent=%ux%u layers=%u guest-layers=%zu guest-layer-bytes=%llu upload-bytes=%llu linear-bytes=%llu\n", static_cast<unsigned long long>(resource.baseAddress), extent.width, extent.height, layers, uploads.size(), static_cast<unsigned long long>(geometry.layerBytes), static_cast<unsigned long long>(uploadedBytes), static_cast<unsigned long long>(sliceBytes() * layers));
         }
-        if (!uploads.empty()) {
-            Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
-            context.detiler->BeginBatch();
-        }
-        auto* recorder = Recorder::Active();
-        std::unique_ptr<CommandBatch> batch;
-        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
-        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
-        const auto gpuTiming = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::StagingIn) : Recorder::NoTiming;
-        const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        std::vector<VkBufferImageCopy> regions(layers);
-        timing.Mark("command_setup");
-        for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            auto& region = regions[layer];
-            region.bufferOffset = sliceBytes() * layer;
-            region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-            region.imageExtent = {extent.width, extent.height, 1};
-            if (slices[layer] != VK_NULL_HANDLE) context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slices[layer], VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &region);
-            region.imageSubresource = {aspect(), 0, layer, 1};
-        }
-        timing.Mark("resident_copy_record", sliceBytes() * (layers - uploads.size()));
-        if (!uploads.empty()) {
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-            std::size_t next = 0;
-            for (std::uint32_t layer = 0; layer < layers; ++layer) {
-                if (slices[layer] != VK_NULL_HANDLE) continue;
-                context.detiler->Dispatch(commands, resource.tileMode, format == VK_FORMAT_D32_SFLOAT ? 4u : 2u, uploads[next++]->Handle(), 0, staging->Handle(), geometry.LinearLayerOffset(layer), geometry.mips.front(), false, layer, geometry.thick);
-            }
-            if (recorder != nullptr) {
-                for (auto& upload : uploads) recorder->Keep(upload, upload->Bytes().size());
-            }
-        }
-        timing.Mark("guest_detile_record", uploadedBytes);
-        VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toTransfer.image = image;
-        toTransfer.subresourceRange = {aspect(), 0, 1, 0, layers};
-        const VkBufferMemoryBarrier staged{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, staging->Handle(), 0, VK_WHOLE_SIZE};
-        const auto copyCommands = commands;
-        barrier(copyCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &staged, 1, &toTransfer);
-        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(copyCommands, staging->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, layers, regions.data());
-        VkImageMemoryBarrier toGeneral = toTransfer;
-        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barrier(copyCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-        if (recorder != nullptr) recorder->EndGpuTiming(gpuTiming, sliceBytes() * layers);
-        timing.Mark("array_copy_record", sliceBytes() * layers);
-        if (batch) batch->SubmitAndWait();
-        else Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
-        timing.Mark("submit_wait");
+        if (!copiedLayers.empty() || !uploads.empty()) record(slices, resource, geometry, copiedLayers, uploads, uploadLayers, timing);
+        guestLayers = std::move(nextGuestLayers);
+        surfaceLayers = std::move(nextSurfaceLayers);
         const std::array<std::uint32_t, 5> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType)};
         auto& texture = textures[key];
         if (texture == nullptr) {
@@ -392,12 +370,91 @@ public:
     const std::uint32_t layers;
 
 private:
+    struct GuestLayer {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        TextureTileMode tileMode = TextureTileMode::kLinear;
+        bool thick = false;
+        std::uint64_t generation = 0;
+        std::uint64_t mappingGeneration = 0;
+        std::uint32_t mipCount = 0;
+        std::uint64_t pendingSerial = 0;
+    };
+
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::unique_ptr<DeviceBuffer> staging;
     std::map<std::array<std::uint32_t, 5>, std::shared_ptr<Texture>> textures;
     bool tracedShape = false;
     std::size_t tracedUploads = 0;
+    std::vector<GuestLayer> guestLayers;
+    std::vector<DepthPlaneSlice> surfaceLayers;
+    bool filled = false;
+
+    void record(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, const SurfaceGeometry& geometry, std::span<const std::uint32_t> copiedLayers, std::span<const std::shared_ptr<Buffer>> uploads, std::span<const std::uint32_t> uploadLayers, PerformanceTimer& timing) {
+        if (!uploads.empty()) {
+            Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
+            context.detiler->BeginBatch();
+        }
+        auto* recorder = Recorder::Active();
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        const auto gpuTiming = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::StagingIn) : Recorder::NoTiming;
+        const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        std::vector<VkBufferImageCopy> regions;
+        const auto region = [&](std::uint32_t layer, VkImageAspectFlags aspectMask, std::uint32_t imageLayer) {
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = sliceBytes() * layer;
+            copy.imageSubresource = {aspectMask, 0, imageLayer, 1};
+            copy.imageExtent = {extent.width, extent.height, 1};
+            return copy;
+        };
+        timing.Mark("command_setup");
+        for (const auto layer : copiedLayers) {
+            const auto copy = region(layer, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slices[layer].image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &copy);
+            regions.push_back(region(layer, aspect(), layer));
+        }
+        timing.Mark("resident_copy_record", sliceBytes() * copiedLayers.size());
+        if (!uploads.empty()) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            for (std::size_t upload = 0; upload < uploads.size(); ++upload) {
+                const auto layer = uploadLayers[upload];
+                context.detiler->Dispatch(commands, resource.tileMode, format == VK_FORMAT_D32_SFLOAT ? 4u : 2u, uploads[upload]->Handle(), 0, staging->Handle(), geometry.LinearLayerOffset(layer), geometry.mips.front(), false, layer, geometry.thick);
+                regions.push_back(region(layer, aspect(), layer));
+            }
+            if (recorder != nullptr) {
+                for (const auto& upload : uploads) recorder->Keep(upload, upload->Bytes().size());
+            }
+        }
+        timing.Mark("guest_detile_record", geometry.layerBytes * uploads.size());
+        VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toTransfer.oldLayout = filled ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.image = image;
+        toTransfer.subresourceRange = {aspect(), 0, 1, 0, layers};
+        const VkBufferMemoryBarrier staged{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, staging->Handle(), 0, VK_WHOLE_SIZE};
+        barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &staged, 1, &toTransfer);
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        VkImageMemoryBarrier toGeneral = toTransfer;
+        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+        if (recorder != nullptr) recorder->EndGpuTiming(gpuTiming, sliceBytes() * regions.size());
+        timing.Mark("array_copy_record", sliceBytes() * regions.size());
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
+        filled = true;
+        timing.Mark("submit_wait");
+    }
 
     VkDeviceSize sliceBytes() const {
         return static_cast<VkDeviceSize>(extent.width) * extent.height * (format == VK_FORMAT_D32_SFLOAT ? 4u : 2u);
@@ -485,6 +542,8 @@ void noteHtileWrites(DepthSurface& surface, const DepthTarget& target) {
     surface.htileGeneration = GuestMemory::CollectWrites(target.htileAddress, bytes);
 }
 
+const DepthSurface* drawnDepth = nullptr;
+
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -541,6 +600,8 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         if (surface.get() != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->retired = true;
     }
     bound->NoteWritten();
+    bound->written = ++depthWrites;
+    drawnDepth = bound;
     return bound->view;
 }
 
@@ -664,6 +725,7 @@ void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t b
 
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
+    drawnDepth = nullptr;
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
     std::erase_if(planeCopies(), [&](const auto& entry) { return std::get<0>(entry.first) == device; });
 }
@@ -703,7 +765,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         std::snprintf(text, sizeof(text), "AGC graphics: sampling the depth planes of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), dimension %d, %u slices, levels %u-%u, base slice %u is not implemented", static_cast<unsigned long long>(base.address), base.extent.width, base.extent.height, static_cast<int>(base.format), resource.width, resource.height, resource.format, static_cast<int>(format), static_cast<int>(resource.dimension), layers, resource.baseLevel, resource.lastLevel, resource.baseArray);
         throw std::runtime_error(text);
     }
-    std::vector<VkImage> slices;
+    std::vector<DepthPlaneSlice> slices;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const auto address = base.address + static_cast<std::uint64_t>(layer) * DepthSliceBytes(base.extent, d16 ? 2u : 4u);
         const auto slice = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && !surface->retired && surface->target.address == address && surface->target.extent.width == base.extent.width && surface->target.extent.height == base.extent.height && surface->target.format == base.format; });
@@ -711,7 +773,8 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
             (*slice)->ApplyFastClear();
             (*slice)->TakeWrites();
         }
-        slices.push_back(slice == list.rend() ? VK_NULL_HANDLE : (*slice)->image);
+        if (slice == list.rend()) slices.push_back({});
+        else slices.push_back({(*slice)->image, slice->get() == drawnDepth ? 0u : (*slice)->written});
     }
     const auto imageFormat = integer ? VK_FORMAT_R16_UINT : d16 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
     auto& copy = planeCopies()[{context.device, base.address, base.extent.width, base.extent.height, imageFormat, layers}];
