@@ -440,6 +440,9 @@ void noteHtileWrites(DepthSurface& surface, const DepthTarget& target) {
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
     if (cleared == 0) return;
+    static const bool traceHtileClears = std::getenv("APS5_TRACE_HTILE_CLEARS") != nullptr;
+    static std::atomic<std::uint32_t> tracedClears{0};
+    if (traceHtileClears && tracedClears.fetch_add(1, std::memory_order_relaxed) < 256u) std::fprintf(stderr, "[htile-clear] address=0x%llx extent=%ux%u bytes=%zu stencil=%u aspects=0x%x first=0x%08x\n", static_cast<unsigned long long>(target.htileAddress), target.extent.width, target.extent.height, bytes, target.htileStencil ? 1u : 0u, cleared, words.front());
     surface.pendingClear |= cleared;
     for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
     GuestMemory::Write(target.htileAddress, std::as_bytes(std::span(words)), 4);
