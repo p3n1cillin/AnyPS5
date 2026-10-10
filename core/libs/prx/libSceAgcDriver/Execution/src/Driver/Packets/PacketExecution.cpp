@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
+#include <sstream>
 
 namespace AgcDriver::DriverDetail {
 
@@ -261,6 +262,22 @@ void Driver::execute(const Submission& submission) {
                         std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
                     }
                 } catch (const std::exception& error) {
+                    static const bool dumpRejectedDraw = std::getenv("APS5_DUMP_REJECTED_DRAW") != nullptr;
+                    if (dumpRejectedDraw) {
+                        std::ostringstream state;
+                        state << "[draw-rejected] submission=" << submission.serial << " queue=" << std::hex << submission.queue << " offset=" << std::dec << cursor << " reason=" << error.what() << '\n';
+                        state << "[draw-rejected] packet" << std::hex;
+                        for (const auto word : packet) state << ' ' << word;
+                        state << '\n';
+                        const auto dumpBank = [&](const char* bank, const Registers& registers) {
+                            for (const auto [offset, value] : registers) state << "[draw-rejected] " << bank << ' ' << offset << ' ' << value << '\n';
+                        };
+                        dumpBank("context", queue.context);
+                        dumpBank("shader", queue.shader);
+                        dumpBank("user-config", queue.userConfig);
+                        const auto text = state.str();
+                        std::fprintf(stderr, "%s", text.c_str());
+                    }
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
                     throw;
