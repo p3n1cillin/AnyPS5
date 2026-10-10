@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -42,6 +44,9 @@ constexpr int Skipped = 77;
 PFN_vkGetDeviceProcAddr realDeviceProc = nullptr;
 PFN_vkCmdCopyImageToBuffer realCopyImageToBuffer = nullptr;
 PFN_vkCmdCopyBufferToImage realCopyBufferToImage = nullptr;
+PFN_vkBeginCommandBuffer realBeginCommandBuffer = nullptr;
+VkImage planeImage = VK_NULL_HANDLE;
+bool rejectNextBegin = false;
 std::atomic<std::uint32_t> imageToBufferCopies{0};
 std::atomic<std::uint32_t> bufferToImageCopies{0};
 
@@ -52,12 +57,32 @@ VKAPI_ATTR void VKAPI_CALL CountImageToBuffer(VkCommandBuffer commands, VkImage 
 
 VKAPI_ATTR void VKAPI_CALL CountBufferToImage(VkCommandBuffer commands, VkBuffer buffer, VkImage image, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
     bufferToImageCopies.fetch_add(1);
+    if (count == 2 && regions[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) planeImage = image;
     realCopyBufferToImage(commands, buffer, image, layout, count, regions);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateReadablePlane(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* callbacks, VkImage* image) {
+    auto readable = *info;
+    if (info->arrayLayers == 2 && info->format == VK_FORMAT_D32_SFLOAT) readable.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    return reinterpret_cast<PFN_vkCreateImage>(realDeviceProc(device, "vkCreateImage"))(device, &readable, callbacks, image);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL BeginPlaneBatch(VkCommandBuffer commands, const VkCommandBufferBeginInfo* info) {
+    if (rejectNextBegin) {
+        rejectNextBegin = false;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    return realBeginCommandBuffer(commands, info);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL CountingDeviceProc(VkDevice device, const char* name) {
     const auto function = realDeviceProc(device, name);
     if (function == nullptr) return nullptr;
+    if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&CreateReadablePlane);
+    if (std::strcmp(name, "vkBeginCommandBuffer") == 0) {
+        realBeginCommandBuffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(function);
+        return reinterpret_cast<PFN_vkVoidFunction>(&BeginPlaneBatch);
+    }
     if (std::strcmp(name, "vkCmdCopyImageToBuffer") == 0) {
         realCopyImageToBuffer = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(function);
         return reinterpret_cast<PFN_vkVoidFunction>(&CountImageToBuffer);
@@ -193,6 +218,7 @@ public:
     }
 
     ~WatchedBlock() {
+        SetGuestReadable(true);
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
         GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
@@ -209,6 +235,18 @@ public:
     std::uint8_t* Data() const { return block; }
     std::uint64_t Address() const { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block)); }
 
+    void SetGuestReadable(bool readable) const {
+        auto* guest = block + LayerBytes;
+        GuestAllocations::Mutation().Protect(guest, LayerBytes, readable, readable, false, [&] {
+#ifdef _WIN32
+            DWORD old;
+            Require(VirtualProtect(guest, LayerBytes, readable ? PAGE_READWRITE : PAGE_NOACCESS, &old) != 0, "cannot protect the guest depth layer");
+#else
+            Require(mprotect(guest, LayerBytes, readable ? PROT_READ | PROT_WRITE : PROT_NONE) == 0, "cannot protect the guest depth layer");
+#endif
+        });
+    }
+
 private:
     std::uint8_t* block = nullptr;
 };
@@ -223,6 +261,24 @@ void CountReads(std::uint64_t address, std::size_t bytes) {
 
 void FillLayer(std::uint8_t* layer, float depth) {
     for (std::size_t offset = 0; offset < LayerBytes; offset += sizeof(depth)) std::memcpy(layer + offset, &depth, sizeof(depth));
+}
+
+void ExpectPlane(const Context& context, float resident, float guest) {
+    Require(planeImage != VK_NULL_HANDLE, "the test did not capture the depth array image");
+    Buffer pixels(context, BlockBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch batch(context);
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 2};
+    region.imageExtent = {Side, Side, 1};
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), planeImage, VK_IMAGE_LAYOUT_GENERAL, pixels.Handle(), 1, &region);
+    batch.SubmitAndWait();
+    pixels.Invalidate();
+    for (std::size_t offset = 0; offset < BlockBytes; offset += sizeof(float)) {
+        float actual;
+        std::memcpy(&actual, pixels.Bytes().data() + offset, sizeof(actual));
+        Require(actual == (offset < LayerBytes ? resident : guest), "the reused depth array contains stale or discarded pixels");
+    }
 }
 
 void Run(const Context& base, const WatchedBlock& block) {
@@ -260,6 +316,7 @@ void Run(const Context& base, const WatchedBlock& block) {
     };
     try {
         Require(sample("at its first use") != 0, "the first sampling of the depth planes did not read the layer no depth surface holds");
+        ExpectPlane(context, 1.0f, 0.25f);
         Require(sample("again") == 0, "sampling the depth planes again read the guest layer no depth surface holds although nothing wrote it");
         FillLayer(block.Data() + LayerBytes, 0.75f);
         Require(sample("after a CPU write") != 0, "sampling the depth planes after a CPU write to the guest layer did not read it again");
@@ -288,11 +345,77 @@ void Run(const Context& base, const WatchedBlock& block) {
         FillLayer(block.Data() + LayerBytes, 0.5f);
         copies("after a CPU write to the guest layer only", 0, 1);
         copies("with nothing written since the CPU write", 0, 0);
+        ExpectPlane(context, 1.0f, 0.5f);
+        FillLayer(block.Data() + LayerBytes, 0.875f);
+        rejectNextBegin = true;
+        bool rejected = false;
+        try { sample("with a failed command batch"); } catch (const std::exception&) { rejected = true; }
+        Require(rejected && !rejectNextBegin, "the controlled depth-copy command failure was not exercised");
+        Require(sample("after retrying the failed copy") != 0, "a failed depth refresh published a guest-layer reuse proof");
+        ExpectPlane(context, 1.0f, 0.875f);
+        block.SetGuestReadable(false);
+        Require(sample("after the guest layer became inaccessible") != 0, "a protected guest depth layer reused pixels from its old mapping");
+        ExpectPlane(context, 1.0f, 0.0f);
+        block.SetGuestReadable(true);
+        Require(sample("after restoring the guest mapping") != 0, "a restored guest depth layer reused its inaccessible snapshot");
+        ExpectPlane(context, 1.0f, 0.875f);
+        DepthSurfaceView(context, DepthTarget{address + LayerBytes, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 0.625f, 0});
+        Require(sample("while the guest layer has a resident depth surface") == 0, "a resident depth layer was uploaded from guest memory");
+        ExpectPlane(context, 1.0f, 0.625f);
+        RetireDepthSurfaces(context.device, address + LayerBytes, LayerBytes);
+        Require(sample("after the resident layer was retired") != 0, "a retired depth layer reused its former guest proof");
+        ExpectPlane(context, 1.0f, 0.875f);
     } catch (...) {
         AgcDriver::GuestMemory::SetFlushHook(nullptr);
         throw;
     }
     AgcDriver::GuestMemory::SetFlushHook(nullptr);
+}
+
+void RunStorageWrite(const Context& base, const WatchedBlock& block) {
+    ClearDepthSurfaces(base.device);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    Recorder recorder(context);
+    context.recorder = &recorder;
+    recorder.Activate();
+    FillLayer(block.Data(), 1.0f);
+    FillLayer(block.Data() + LayerBytes, 0.25f);
+    DepthSurfaceView(context, DepthTarget{block.Address(), 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+    DepthSurfaceView(context, DepthTarget{block.Address() + 2 * BlockBytes, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+    GuestTextureResource resource{};
+    resource.baseAddress = block.Address();
+    resource.width = Side;
+    resource.height = Side;
+    resource.depthOrLastArray = 1;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kZ64KBX;
+    resource.dimension = TextureDimension::k2DArray;
+    resource.format = Format32Float;
+    const std::array<std::uint32_t, 8> words{};
+    const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    Require(DepthSurfaceTexture(context, words, resource, identity) != nullptr, "the recorded depth array was not sampled");
+    recorder.Sync();
+    ExpectPlane(base, 1.0f, 0.25f);
+    auto written = resource;
+    written.baseAddress += LayerBytes;
+    written.depthOrLastArray = 0;
+    written.dimension = TextureDimension::k2D;
+    auto storage = std::make_shared<StorageTexture>(context, detiler, written, 0);
+    recorder.Sync();
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    const VkClearColorValue clear{{0.75f, 0.0f, 0.0f, 0.0f}};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+    storage->MarkDirty();
+    Require(!Recorder::SnapshotWriteOverlaps(written.baseAddress, LayerBytes), "the deferred storage test unexpectedly has a pending buffer write");
+    Require(DepthSurfaceTexture(context, words, resource, identity) != nullptr, "the depth array was not sampled after its guest layer's storage writer");
+    recorder.Sync();
+    ExpectPlane(base, 1.0f, 0.75f);
+    storage.reset();
 }
 
 }
@@ -315,6 +438,7 @@ int main() {
             WatchedBlock block;
             Require(AgcDriver::GuestMemory::Watched(block.Address(), BlockBytes), "depth plane guest layers: the guest block is not write-watched");
             Run(device->GetContext(), block);
+            RunStorageWrite(device->GetContext(), block);
         }
         device.reset();
         std::puts("depth plane guest layer tests passed");

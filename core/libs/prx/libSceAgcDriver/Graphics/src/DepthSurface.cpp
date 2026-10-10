@@ -5,8 +5,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -316,9 +318,11 @@ public:
         std::vector<std::shared_ptr<Buffer>> uploads;
         std::vector<std::uint32_t> uploadLayers;
         std::vector<std::uint32_t> copiedLayers;
+        auto nextGuestLayers = guestLayers;
+        auto nextSurfaceLayers = surfaceLayers;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            auto& held = guestLayers[layer];
-            auto& surface = surfaceLayers[layer];
+            auto& held = nextGuestLayers[layer];
+            auto& surface = nextSurfaceLayers[layer];
             if (slices[layer].image != VK_NULL_HANDLE) {
                 held = {};
                 if (slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) continue;
@@ -327,9 +331,10 @@ public:
                 continue;
             }
             surface = {};
-            const GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
-            if (held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation)) {
-                held.generation = current.generation;
+            const GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes)), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), resource.mipCount, StorageTexture::PendingSerial()};
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{current.address, current.address + current.bytes}}};
+            if (held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && held.mappingGeneration == current.mappingGeneration && held.mipCount == current.mipCount && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation) && (held.pendingSerial == current.pendingSerial || (!StorageTexture::AnyPendingOverlaps(range) && !AnyShadowedOverlaps(range)))) {
+                held = current;
                 continue;
             }
             auto upload = std::make_shared<Buffer>(uploadContext, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -348,6 +353,8 @@ public:
             if (tracedShapes.fetch_add(1, std::memory_order_relaxed) < 256u) std::fprintf(stderr, "[depth-plane-copy] address=0x%llx extent=%ux%u layers=%u guest-layers=%zu guest-layer-bytes=%llu upload-bytes=%llu linear-bytes=%llu\n", static_cast<unsigned long long>(resource.baseAddress), extent.width, extent.height, layers, uploads.size(), static_cast<unsigned long long>(geometry.layerBytes), static_cast<unsigned long long>(uploadedBytes), static_cast<unsigned long long>(sliceBytes() * layers));
         }
         if (!copiedLayers.empty() || !uploads.empty()) record(slices, resource, geometry, copiedLayers, uploads, uploadLayers, timing);
+        guestLayers = std::move(nextGuestLayers);
+        surfaceLayers = std::move(nextSurfaceLayers);
         const std::array<std::uint32_t, 5> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType)};
         auto& texture = textures[key];
         if (texture == nullptr) {
@@ -369,6 +376,9 @@ private:
         TextureTileMode tileMode = TextureTileMode::kLinear;
         bool thick = false;
         std::uint64_t generation = 0;
+        std::uint64_t mappingGeneration = 0;
+        std::uint32_t mipCount = 0;
+        std::uint64_t pendingSerial = 0;
     };
 
     VkImage image = VK_NULL_HANDLE;
@@ -438,11 +448,11 @@ private:
         toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-        filled = true;
         if (recorder != nullptr) recorder->EndGpuTiming(gpuTiming, sliceBytes() * regions.size());
         timing.Mark("array_copy_record", sliceBytes() * regions.size());
         if (batch) batch->SubmitAndWait();
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
+        filled = true;
         timing.Mark("submit_wait");
     }
 
