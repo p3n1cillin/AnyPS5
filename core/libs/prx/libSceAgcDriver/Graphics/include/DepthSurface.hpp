@@ -12,6 +12,7 @@ namespace AgcDriver::Graphics {
 class Texture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
+void ResummarizeDepthSurface(const Context& context, const DepthTarget& target, std::span<const std::uint8_t> coverage);
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
 std::uint64_t HtileSliceBytes(VkExtent2D extent);
 std::uint64_t HtileWordOffset(VkExtent2D extent, std::uint32_t x, std::uint32_t y, std::uint32_t slice = 0, std::uint32_t pipeXor = 0);

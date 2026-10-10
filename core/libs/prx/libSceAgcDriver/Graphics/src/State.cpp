@@ -193,7 +193,7 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
 }
 
 void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result) {
-    zero(cx, 0x000, 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
+    zero(cx, 0x000, result.depthResummarize ? 0x00001f8fu : 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
     zero(cx, 0x010, 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
@@ -234,6 +234,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
         depth.htileStencil = stencil && (read(cx, 0x011) & (1u << 29u)) == 0;
     }
     result.depth = depth;
+    if (result.depthResummarize) Require(zFormat == 3 && depth.htileAddress != 0 && !depth.htileStencil, "resummarization requires D32 depth-only HTILE");
     result.depthTest = (depthControl & 2u) != 0;
     result.depthWrite = result.depthTest && (depthControl & 4u) != 0 && !depthReadOnly;
     result.depthCompare = static_cast<VkCompareOp>((depthControl >> 4u) & 7u);
@@ -486,6 +487,13 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
 std::string DepthMaintenanceRejection(const QueueState& queue) {
     const auto control = find(queue.context, 0x000);
     if (control == queue.context.end() || (control->second & ~0x2063u) == 0) return {};
+    if (control->second == 0x10u) {
+        const auto override = find(queue.context, 0x003);
+        const auto depth = find(queue.context, 0x200);
+        const auto zExport = find(queue.context, 0x1c4);
+        const auto shaderControl = find(queue.context, 0x203);
+        if (override != queue.context.end() && override->second == (1u << 29u) && depth != queue.context.end() && depth->second == 0 && zExport != queue.context.end() && zExport->second == 0 && shaderControl != queue.context.end() && (shaderControl->second & PixelStageRunsMask) == 0 && ColorWriteMask(queue.context) == 0 && PixelProgramSkipped(queue)) return {};
+    }
     return zeroMessage(0x000, control->second, "DB_RENDER_CONTROL depth copy, resummarize or decompress");
 }
 
@@ -493,6 +501,7 @@ State DecodeState(const QueueState& queue) {
     if (auto reason = DepthMaintenanceRejection(queue); !reason.empty()) throw std::runtime_error(reason);
     const auto& cx = queue.context;
     State result{};
+    if (const auto control = find(cx, 0x000); control != cx.end()) result.depthResummarize = (control->second & 0x10u) != 0;
     result.conservativeRasterization = decodeConservativeRasterization(queue);
     result.stages = DecodeShaderStages(queue);
     const auto primitive = read(queue.userConfig, 0x242, RegisterBank::UserConfig);
@@ -515,6 +524,7 @@ State DecodeState(const QueueState& queue) {
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
     result.primitiveRestart = read(queue.userConfig, 0x24b, RegisterBank::UserConfig) != 0 && !result.rectList && result.topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
     if ((read(cx, 0x207) & LayerExports) != 0) {
+        Require(!result.depthResummarize, "resummarization with layer or viewport exports is unmeasured");
         static bool reported = false;
         if (!reported) {
             reported = true;
@@ -524,7 +534,8 @@ State DecodeState(const QueueState& queue) {
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
     {
         const auto depthControl = read(cx, 0x200);
-        if ((depthControl & 0xbu) != 0 && depthSurfaceBound(cx)) {
+        Require(!result.depthResummarize || depthSurfaceBound(cx), "resummarization requires a bound depth surface");
+        if (((depthControl & 0xbu) != 0 || result.depthResummarize) && depthSurfaceBound(cx)) {
             decodeDepth(cx, depthControl, result);
         } else if (depthPassThrough(depthControl) || ((depthControl & 3u) != 0 && depthPlanesAbsent(cx))) {
             static bool reported = false;

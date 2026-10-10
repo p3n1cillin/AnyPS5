@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -519,6 +521,113 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     }
     bound->NoteWritten();
     return bound->view;
+}
+
+void ResummarizeDepthSurface(const Context& context, const DepthTarget& target, std::span<const std::uint8_t> coverage) {
+    Require(!target.htileStencil && (target.format == VK_FORMAT_D32_SFLOAT || target.format == VK_FORMAT_D32_SFLOAT_S8_UINT), "depth resummarization requires measured D32 depth-only HTILE encoding");
+    const auto metadataBytes = static_cast<std::size_t>(HtileSliceBytes(target.extent));
+    const auto pixelCount = static_cast<std::size_t>(target.extent.width) * target.extent.height;
+    Require(coverage.size() == pixelCount, "depth resummarization coverage does not match its extent");
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> tiles;
+    for (std::uint32_t y = 0; y < target.extent.height; y += 8u) {
+        for (std::uint32_t x = 0; x < target.extent.width; x += 8u) {
+            std::size_t covered = 0;
+            const auto width = std::min(8u, target.extent.width - x);
+            const auto height = std::min(8u, target.extent.height - y);
+            for (std::uint32_t row = 0; row < height; ++row) {
+                for (std::uint32_t column = 0; column < width; ++column) covered += coverage[(y + row) * target.extent.width + x + column] != 0;
+            }
+            Require(covered == 0 || covered == width * height, "partial HTILE tile resummarization coverage is unmeasured");
+            if (covered != 0) tiles.emplace_back(x, y);
+        }
+    }
+    if (tiles.empty()) return;
+    Require(target.htileAddress != 0 && context.detiler != nullptr, "depth resummarization needs HTILE memory and a depth retiler");
+    const auto depthBytes = static_cast<std::size_t>(DepthSliceBytes(target.extent, 4u));
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(target.address), depthBytes, 4, true);
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(target.htileAddress), metadataBytes, 4, true);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    Require(Recorder::Active() == context.recorder, "depth resummarization requires its device's active recorder");
+    if (context.recorder != nullptr) context.recorder->Sync();
+    DepthSurface* resident = nullptr;
+    {
+        std::lock_guard lock(surfacesMutex());
+        for (const auto& surface : surfaces()) {
+            if (surface->context.device == context.device && !surface->retired && sameSurface(surface->target, target)) resident = surface.get();
+        }
+        Require(resident != nullptr, "depth resummarization requires a coherent resident depth surface");
+        if (resident->OverwrittenInMemory()) {
+            const auto writer = resident->writer.lock();
+            Require(writer != nullptr && !GuestMemory::WrittenSince(target.address, depthBytes, writer->Generation()), "resummarization after an unresolved CPU depth write is unsupported");
+        }
+    }
+    DepthSurfaceView(context, target);
+    if (context.recorder != nullptr) context.recorder->Sync();
+    const auto layout = ComputeElementMipLayout(TextureTileMode::kZ64KBX, 4u, target.extent.width, target.extent.height, 1u).front();
+    Require(layout.tiledSize == depthBytes, "depth resummarization layout does not match its base allocation");
+    Buffer linear(context, layout.linearSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer tiled(context, depthBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::vector<std::byte> originalDepth(depthBytes);
+    GuestMemory::Read(target.address, originalDepth, 4);
+    std::memcpy(tiled.Bytes().data(), originalDepth.data(), depthBytes);
+    std::vector<std::uint32_t> metadata(metadataBytes / 4u);
+    GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(metadata)), 4);
+    const auto originalMetadata = metadata;
+    context.detiler->BeginBatch();
+    CommandBatch batch(context);
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy region{};
+    region.bufferRowLength = layout.pitchBytes / 4u;
+    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    region.imageExtent = {target.extent.width, target.extent.height, 1};
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), resident->image, VK_IMAGE_LAYOUT_GENERAL, linear.Handle(), 1, &region);
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    if (tiles.size() == static_cast<std::size_t>((target.extent.width + 7u) / 8u) * ((target.extent.height + 7u) / 8u)) {
+        context.detiler->Dispatch(batch.Handle(), TextureTileMode::kZ64KBX, 4u, linear.Handle(), 0, tiled.Handle(), 0, layout, true, target.htileSlice);
+    } else {
+        for (std::size_t index = 0; index < tiles.size();) {
+            const auto [x, y] = tiles[index++];
+            auto end = x + 8u;
+            while (index < tiles.size() && tiles[index].second == y && tiles[index].first == end) {
+                end += 8u;
+                ++index;
+            }
+            DetileWindow window{};
+            window.columnBegin = x;
+            window.columnEnd = std::min(end, target.extent.width);
+            window.rowBegin = y;
+            window.rowEnd = std::min(y + 8u, target.extent.height);
+            context.detiler->Dispatch(batch.Handle(), TextureTileMode::kZ64KBX, 4u, linear.Handle(), 0, tiled.Handle(), 0, layout, true, target.htileSlice, false, window);
+        }
+    }
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+    linear.Invalidate();
+    tiled.Invalidate();
+    std::vector<float> depths(pixelCount);
+    for (std::uint32_t row = 0; row < target.extent.height; ++row) std::memcpy(depths.data() + static_cast<std::size_t>(row) * target.extent.width, linear.Bytes().data() + static_cast<std::size_t>(row) * layout.pitchBytes, target.extent.width * 4u);
+    for (const auto [x, y] : tiles) {
+        float minimum = 1.0f;
+        float maximum = 0.0f;
+        for (std::uint32_t row = y; row < std::min(y + 8u, target.extent.height); ++row) {
+            for (std::uint32_t column = x; column < std::min(x + 8u, target.extent.width); ++column) {
+                const auto depth = depths[static_cast<std::size_t>(row) * target.extent.width + column];
+                Require(std::isfinite(depth) && depth >= 0.0f && depth <= 1.0f, "depth resummarization of nonfinite or out-of-range D32 values is unmeasured");
+                minimum = std::min(minimum, depth);
+                maximum = std::max(maximum, depth);
+            }
+        }
+        const auto quantize = [](float depth) { return std::min(static_cast<std::uint32_t>(depth * 16384.0f), 16383u); };
+        const auto index = (HtileWordOffset(target.extent, x, y, target.htileSlice, target.htilePipeXor) % metadataBytes) / 4u;
+        metadata[index] = (quantize(maximum) << 18u) | (quantize(minimum) << 4u) | 0xfu;
+    }
+    GuestMemory::WriteChanged(target.address, tiled.Bytes(), originalDepth);
+    GuestMemory::WriteChanged(target.htileAddress, std::as_bytes(std::span(metadata)), std::as_bytes(std::span(originalMetadata)));
+    {
+        std::lock_guard lock(surfacesMutex());
+        resident->htileGeneration = GuestMemory::CollectWrites(target.htileAddress, metadataBytes);
+        resident->NoteWritten();
+    }
 }
 
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {

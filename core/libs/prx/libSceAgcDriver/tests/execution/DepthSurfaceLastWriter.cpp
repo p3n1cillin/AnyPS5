@@ -271,6 +271,74 @@ void ColorStorageWriter(const Context& context, std::uint64_t address) {
     ClearCachedTextures(context.device);
 }
 
+void ResummarizeStorageWriter(const Context& context) {
+    alignas(256) static std::array<std::uint32_t, 16384> fallback;
+    const auto watched = AgcDriver::GuestMemory::WriteWatched();
+    const auto depth = watched ? std::span(static_cast<std::uint32_t*>(AllocateWatched(Block)), fallback.size()) : std::span(fallback);
+    alignas(256) static std::array<std::uint32_t, 8192> metadata;
+    std::fill(depth.begin(), depth.end(), 0xdeadbeef);
+    metadata.fill(0xfffc000f);
+    metadata[4] = 0xabcdef0f;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    TextureDetiler detiler(context);
+    auto configured = context;
+    configured.detiler = &detiler;
+    auto target = Depth(reinterpret_cast<std::uintptr_t>(depth.data()));
+    target.clearDepth = 0.25f;
+    target.htileAddress = reinterpret_cast<std::uintptr_t>(metadata.data());
+    DepthSurfaceView(configured, target);
+    auto storage = std::make_shared<StorageTexture>(configured, detiler, View(Extent.width, Extent.height, target.address), 0);
+    SeedStorageFromDepth(configured, storage);
+    {
+        CommandBatch batch(configured);
+        RecordMemoryBarrier(configured, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue clear{{0.75f, 0.0f, 0.0f, 0.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        configured.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(batch.Handle(), storage->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        batch.SubmitAndWait();
+    }
+    std::array<std::uint8_t, Extent.width * Extent.height> coverage;
+    coverage.fill(1);
+    ResummarizeDepthSurface(configured, target, coverage);
+    for (std::uint32_t y = 0; y < Extent.height; y += 8) {
+        for (std::uint32_t x = 0; x < Extent.width; x += 8) Require(metadata[HtileWordOffset(Extent, x, y) / 4] == 0xc003000f, "resummarization did not take the pending storage depth writer");
+    }
+    float first;
+    std::memcpy(&first, depth.data(), sizeof(first));
+    Require(first == 0.75f && depth.back() == 0xdeadbeef && metadata[4] == 0xabcdef0f, "storage resummarization changed depth data or padding");
+    SeedStorageFromDepth(configured, storage);
+    {
+        Buffer input(configured, Extent.width * Extent.height * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        for (std::uint32_t y = 0; y < Extent.height; ++y) {
+            for (std::uint32_t x = 0; x < Extent.width; ++x) {
+                const float value = ((x ^ y) & 1u) != 0 ? 0.8f : 0.2f;
+                std::memcpy(input.Bytes().data() + (y * Extent.width + x) * sizeof(float), &value, sizeof(value));
+            }
+        }
+        CommandBatch batch(configured);
+        RecordMemoryBarrier(configured, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {Extent.width, Extent.height, 1};
+        configured.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(batch.Handle(), input.Handle(), storage->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        batch.SubmitAndWait();
+    }
+    ResummarizeDepthSurface(configured, target, coverage);
+    for (std::uint32_t y = 0; y < Extent.height; y += 8) {
+        for (std::uint32_t x = 0; x < Extent.width; x += 8) Require(metadata[HtileWordOffset(Extent, x, y) / 4] == 0xcccccccf, "mixed-depth resummarization differs from the native checkerboard word");
+    }
+    if (watched) {
+        SeedStorageFromDepth(configured, storage);
+        depth.front() = 0x3f600000;
+        AgcDriver::GuestMemory::MarkWritten(target.address, 4);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto before = metadata;
+        bool rejected = false;
+        try { ResummarizeDepthSurface(configured, target, coverage); } catch (const std::exception&) { rejected = true; }
+        Require(rejected && metadata == before && depth.front() == 0x3f600000, "unresolved CPU depth writes published stale GPU metadata");
+    }
+}
+
 void Run(const Context& context) {
     const auto wide = View(2 * Extent.width, Extent.height);
     const auto exact = View(Extent.width, Extent.height);
@@ -365,6 +433,7 @@ int main() {
             return VulkanTestSkipped;
         }
         Run(device->GetContext());
+        ResummarizeStorageWriter(device->GetContext());
         std::puts("depth surface last writer tests passed");
         return 0;
     } catch (const std::exception& error) {

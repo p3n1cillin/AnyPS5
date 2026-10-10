@@ -836,6 +836,38 @@ void depthMaintenanceTests() {
     auto absent = makeState();
     absent.context.erase(0x000);
     Require(AgcDriver::Graphics::DepthMaintenanceRejection(absent).empty(), "an absent depth control produced a maintenance verdict");
+    auto queue = makeState();
+    queue.context[0x000] = 0x10;
+    queue.context[0x003] = 1u << 29u;
+    queue.context[0x200] = 0;
+    queue.context[0x8e] = queue.context[0x8f] = 0;
+    queue.context[0x203] = 0;
+    queue.shader.erase(0x8);
+    queue.context[0x002] = 0;
+    queue.context[0x007] = (31u << 16u) | 63u;
+    queue.context[0x00a] = 0;
+    queue.context[0x00b] = std::bit_cast<std::uint32_t>(1.0f);
+    queue.context[0x010] = 0xa0000183;
+    queue.context[0x011] = 0x20000180;
+    queue.context[0x012] = queue.context[0x014] = 0x100;
+    queue.context[0x005] = 0x300;
+    queue.context[0x2af] = 1u << 18u;
+    Require(AgcDriver::Graphics::DepthMaintenanceRejection(queue).empty(), "D32 resummarization was rejected before depth decoding");
+    std::vector<AgcDriver::Graphics::RegisterRead> log;
+    AgcDriver::Graphics::RegisterReadLog() = &log;
+    const auto decoded = AgcDriver::Graphics::DecodeState(queue);
+    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    Require(decoded.depthResummarize && decoded.depth && !decoded.depthTest && decoded.renderExtent.width == 64 && decoded.renderExtent.height == 32, "disabled depth testing dropped resummarization's bound surface");
+    for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "resummarization read a register missing from the draw key");
+    queue.context[0x003] = 0;
+    Require(!AgcDriver::Graphics::DepthMaintenanceRejection(queue).empty(), "resummarization without FORCE_Z_VALID passed");
+    queue.context[0x003] = 1u << 29u;
+    queue.context[0x010] = 0xa0000181;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "D32 depth-only HTILE");
+    queue.context[0x010] = 0xa0000183;
+    queue.context[0x011] = 0x181;
+    queue.context[0x013] = queue.context[0x015] = 0x200;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "D32 depth-only HTILE");
 }
 
 // SPI_SHADER_Z_FORMAT (0x1c4) and the export enables of DB_SHADER_CONTROL (0x203): Z export needs a

@@ -47,6 +47,7 @@
 #include <deque>
 #include <limits>
 #include <list>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -241,6 +242,11 @@ struct VulkanDevice::State {
     bool contextReady = false;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     std::unique_ptr<Graphics::Recorder> recorder;
+    std::optional<ShaderRecompiler::RecompileResult> depthCoverageShader;
+    struct DepthCoverageDelete {
+        void operator()(std::byte* pointer) const { ::operator delete(pointer, std::align_val_t{65536}); }
+    };
+    std::vector<std::pair<std::size_t, std::unique_ptr<std::byte, DepthCoverageDelete>>> depthCoveragePixels;
     // Device-local buffers of a repeated 16-byte fill pattern (FillBuffer), most recently used
     // last; each is filled once by a doubling chain in device memory.
     std::vector<std::pair<std::array<std::uint32_t, 4>, std::shared_ptr<Graphics::DeviceBuffer>>> patternBuffers;
@@ -2600,6 +2606,10 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }
 
+void VulkanDevice::ResummarizeDepth(const Graphics::DepthTarget& target, std::span<const std::uint8_t> coverage) {
+    Graphics::ResummarizeDepthSurface(graphicsContext(), target, coverage);
+}
+
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
@@ -2610,7 +2620,56 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
     const auto context = graphicsContext();
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
+    if (graphics.depthResummarize) {
+        require(graphics.depth.has_value() && !graphics.hasColorTarget && !graphics.depthTest && !graphics.depthWrite && !graphics.stencilTest && !graphics.depthBoundsTest, "resummarization cannot execute ordinary color or depth writes");
+        require(!graphics.depthBias && !graphics.depthClamp && graphics.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT, "resummarization with depth bias, clamping or conservative coverage is unmeasured");
+        require(graphics.stages.path == Graphics::ShaderPath::Vertex, "resummarization requires measured vertex rasterization");
+        if (!state->depthCoverageShader) {
+            alignas(256) static constexpr std::array<std::uint32_t, 4> code{0x7e0002f2, 0xf800180f, 0x00000000, 0xbf810000};
+            ShaderRecompiler::ShaderPixelStageInfo pixel{};
+            pixel.wave32 = true;
+            pixel.targetOutputMode[0] = 9;
+            pixel.targetExportMapping.fill(0xe4u);
+            const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
+            ShaderRecompiler::RecompileRequest request{
+                {ShaderRecompiler::ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+                {32, 0, {}, std::nullopt, pixel, std::nullopt, memory}, Target(), {0, 0, 0, 128}
+            };
+            request.useCache = false;
+            state->depthCoverageShader = ShaderRecompiler::Recompile(request);
+        }
+        auto coverageState = graphics;
+        const auto extent = graphics.depth->extent;
+        const auto pixels = static_cast<std::size_t>(extent.width) * extent.height;
+        const auto bytes = pixels * 4u;
+        auto found = std::find_if(state->depthCoveragePixels.begin(), state->depthCoveragePixels.end(), [&](const auto& entry) { return entry.first == bytes; });
+        if (found == state->depthCoveragePixels.end()) {
+            state->depthCoveragePixels.emplace_back(bytes, std::unique_ptr<std::byte, State::DepthCoverageDelete>(static_cast<std::byte*>(::operator new(bytes, std::align_val_t{65536}))));
+            found = std::prev(state->depthCoveragePixels.end());
+        }
+        auto* output = found->second.get();
+        std::memset(output, 0, bytes);
+        coverageState.depthResummarize = false;
+        coverageState.depth.reset();
+        coverageState.color = {reinterpret_cast<std::uintptr_t>(output), extent, VK_FORMAT_R8G8B8A8_UNORM, bytes, 0xe4u};
+        coverageState.colors = {coverageState.color};
+        coverageState.hasColorTarget = true;
+        coverageState.renderExtent = extent;
+        coverageState.blend = {};
+        coverageState.blend.colorWriteMask = 15;
+        coverageState.blends = {coverageState.blend};
+        auto coverageShaders = std::vector<Graphics::CompiledShader>(shaders.begin(), shaders.end());
+        const auto fragment = std::find_if(coverageShaders.begin(), coverageShaders.end(), [](const auto& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment; });
+        require(fragment != coverageShaders.end(), "resummarization needs the disabled fragment stage's rasterization interface");
+        *fragment = {ShaderRecompiler::ShaderStage::Fragment, &*state->depthCoverageShader, 0};
+        Graphics::Draw(context, coverageState, draw, coverageShaders, snapshots);
+        context.recorder->Sync();
+        std::vector<std::uint8_t> coverage(pixels);
+        for (std::size_t index = 0; index < pixels; ++index) coverage[index] = std::to_integer<std::uint8_t>(output[index * 4u]);
+        Graphics::ResummarizeDepthSurface(context, *graphics.depth, coverage);
+    } else {
+        Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
+    }
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 
@@ -3047,6 +3106,7 @@ void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck miss) {
 }
 
 RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe) {
+    if (graphics.depthResummarize) return RecipeOutcome::Rebuild;
     PerformanceTimer timing("Vulkan.DrawFromRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)];
