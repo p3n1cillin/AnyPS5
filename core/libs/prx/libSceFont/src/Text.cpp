@@ -143,6 +143,14 @@ FontTextCharacter* TextCharacters(FontStringData* data) {
     return data && data->storage && !data->storage->characters.empty() ? data->storage->characters.data() : nullptr;
 }
 
+void ReferTextCode(FontTextCodes* textCodes, FontTextCharacter* character, FontTextCharacter* termCharacter) {
+    std::memset(textCodes, 0, sizeof(*textCodes));
+    textCodes->order = character->textOrder;
+    textCodes->code = character->characterCode;
+    textCodes->systemUse[0] = character;
+    textCodes->systemUse[1] = termCharacter;
+}
+
 std::uint32_t LevelOf(const FontTextCharacter* character) {
     return static_cast<std::uint32_t>((character->flags >> 24) & 0xFFu);
 }
@@ -549,6 +557,29 @@ FontTextCharacter* APS5_VABI sceFontCharacterRefersTextNext(const FontTextCharac
         if (current->synthetic == 0 && current->clusterIndex == 0) return current;
     }
     return nullptr;
+}
+
+FontTextCodes* APS5_VABI sceFontCharactersRefersTextCodes(FontTextCharacter* textCharacter, FontTextCharacter* termCharacter, FontTextCodes* textCodes) {
+    if (!textCharacter || !textCodes || textCharacter == termCharacter) return nullptr;
+    ReferTextCode(textCodes, textCharacter, termCharacter);
+    return textCodes;
+}
+
+FontTextCodes* APS5_VABI sceFontTextCodesStepNext(FontTextCodes* textCodesStep) {
+    if (!textCodesStep) return nullptr;
+    const auto* current = static_cast<FontTextCharacter*>(textCodesStep->systemUse[0]);
+    auto* termCharacter = static_cast<FontTextCharacter*>(textCodesStep->systemUse[1]);
+    if (!current || !current->next || current->next == termCharacter) return nullptr;
+    ReferTextCode(textCodesStep, current->next, termCharacter);
+    return textCodesStep;
+}
+
+FontTextCodes* APS5_VABI sceFontTextCodesStepBack(FontTextCodes* textCodesStep) {
+    if (!textCodesStep) return nullptr;
+    const auto* current = static_cast<FontTextCharacter*>(textCodesStep->systemUse[0]);
+    if (!current || !current->prev) return nullptr;
+    ReferTextCode(textCodesStep, current->prev, static_cast<FontTextCharacter*>(textCodesStep->systemUse[1]));
+    return textCodesStep;
 }
 
 int APS5_VABI sceFontWritingInit(FontWriting* fontWriting, FontString fontString, const FontTextCharacter* fontCharacter) {
