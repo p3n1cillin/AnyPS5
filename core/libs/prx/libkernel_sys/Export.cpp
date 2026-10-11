@@ -22,6 +22,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "WindowsReadlink.hpp"
 #ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
 #define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
 #endif
@@ -90,12 +91,9 @@ std::int64_t APS5_VABI readlink_nid_postfix(const char* path, char* buffer, std:
     std::filesystem::path native;
     if (const int error = ResolvePathError_nid_no_patch(path, native)) return Fail(error);
 #ifdef _WIN32
-    const DWORD attributes = GetFileAttributesW(native.wstring().c_str());
-    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        NotImplemented_nid_no_patch("readlink of a Windows symbolic link");
-        return -1;
-    }
-#endif
+    std::string target;
+    if (const int error = KernelSys::ReadLinkTarget_nid_no_patch(native, target)) return Fail(error);
+#else
     std::error_code error;
     const auto status = std::filesystem::symlink_status(native, error);
     if (error) return Fail(GuestError(error));
@@ -103,6 +101,7 @@ std::int64_t APS5_VABI readlink_nid_postfix(const char* path, char* buffer, std:
     if (!std::filesystem::is_symlink(status)) return Fail(GuestEinval);
     const auto target = std::filesystem::read_symlink(native, error).generic_string();
     if (error) return Fail(GuestError(error));
+#endif
     const auto count = std::min(size, target.size());
     if (count != 0 && buffer == nullptr) return Fail(GuestEfault);
     if (count != 0) std::memcpy(buffer, target.data(), count);
