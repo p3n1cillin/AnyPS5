@@ -9,8 +9,10 @@
 #include <fstream>
 #include <source_location>
 #include <string>
+#include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libkernel_sys/WindowsReadlink.hpp"
 #endif
 #ifdef __linux__
 #include <cerrno>
@@ -46,7 +48,78 @@ int Error() {
     return *__error_nid_postfix();
 }
 
+#ifdef _WIN32
+static std::vector<std::byte> LinkData(std::uint32_t tag, const std::wstring& target, std::uint16_t offset = 0, std::uint32_t flags = 1) {
+    const std::size_t fixed = tag == IO_REPARSE_TAG_SYMLINK ? 12 : 8;
+    const auto bytes = static_cast<std::uint16_t>(target.size() * sizeof(wchar_t));
+    const auto length = static_cast<std::uint16_t>(fixed + offset + bytes + 4);
+    std::vector<std::byte> data(8 + length);
+    std::memcpy(data.data(), &tag, sizeof(tag));
+    std::memcpy(data.data() + 4, &length, sizeof(length));
+    std::memcpy(data.data() + 8, &offset, sizeof(offset));
+    std::memcpy(data.data() + 10, &bytes, sizeof(bytes));
+    const auto printOffset = static_cast<std::uint16_t>(offset + bytes + 2);
+    std::memcpy(data.data() + 12, &printOffset, sizeof(printOffset));
+    if (tag == IO_REPARSE_TAG_SYMLINK) std::memcpy(data.data() + 16, &flags, sizeof(flags));
+    std::memcpy(data.data() + 8 + fixed + offset, target.data(), bytes);
+    return data;
+}
+
+static void TestLinkData() {
+    std::string target = "unchanged";
+    auto relative = LinkData(IO_REPARSE_TAG_SYMLINK, L"..\\sub\\caf\u00e9-\u732b.txt", 2);
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(relative, target) == 0 && target == "../sub/caf\xc3\xa9-\xe7\x8c\xab.txt");
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(LinkData(IO_REPARSE_TAG_SYMLINK, L"\\??\\C:\\target", 0, 0), target) == 0 && target == "C:/target");
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(LinkData(IO_REPARSE_TAG_MOUNT_POINT, L"\\??\\UNC\\server\\share"), target) == 0 && target == "//server/share");
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(LinkData(IO_REPARSE_TAG_MOUNT_POINT, L"\\\\?\\C:\\target"), target) == 0 && target == "C:/target");
+    target = "unchanged";
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch({}, target) == 5 && target == "unchanged");
+    auto invalid = relative;
+    invalid.resize(12);
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(invalid, target) == 5 && target == "unchanged");
+    invalid = relative;
+    invalid[8] = std::byte{1};
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(invalid, target) == 5 && target == "unchanged");
+    invalid = relative;
+    invalid[10] = std::byte{0xff};
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(invalid, target) == 5 && target == "unchanged");
+    invalid = relative;
+    invalid[16] = std::byte{2};
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(invalid, target) == 5 && target == "unchanged");
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(LinkData(0x80000000, L"target"), target) == 22 && target == "unchanged");
+    Require(KernelSys::DecodeLinkTarget_nid_no_patch(LinkData(IO_REPARSE_TAG_SYMLINK, std::wstring(1, static_cast<wchar_t>(0xd800))), target) == 86 && target == "unchanged");
+}
+
+static void TestJunction(const std::filesystem::path& root) {
+    const auto directory = std::filesystem::absolute(root / "directory");
+    const auto junction = std::filesystem::absolute(root / "junction");
+    Require(std::filesystem::create_directory(directory));
+    Require(std::filesystem::create_directory(junction));
+    std::ofstream(directory / "preserved.txt") << "preserved";
+    auto data = LinkData(IO_REPARSE_TAG_MOUNT_POINT, L"\\??\\" + directory.wstring());
+    const HANDLE handle = CreateFileW(junction.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    Require(handle != INVALID_HANDLE_VALUE);
+    DWORD returned = 0;
+    const BOOL created = DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, data.data(),
+        static_cast<DWORD>(data.size()), nullptr, 0, &returned, nullptr);
+    const DWORD error = created ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    if (!created) std::fprintf(stderr, "junction creation failed: %lu\n", static_cast<unsigned long>(error));
+    Require(created != 0);
+    const auto expected = directory.generic_string();
+    std::vector<char> buffer(expected.size() + 1, '#');
+    Require(readlink_nid_postfix(junction.string().c_str(), buffer.data(), buffer.size()) == static_cast<std::int64_t>(expected.size()));
+    Require(std::memcmp(buffer.data(), expected.data(), expected.size()) == 0 && buffer.back() == '#');
+    Require(RemoveDirectoryW(junction.c_str()) != 0);
+    Require(std::filesystem::file_size(directory / "preserved.txt") == 9);
+}
+#endif
+
 int main() {
+#ifdef _WIN32
+    TestLinkData();
+#endif
     Require(setsid_nid_postfix() == -1 && Error() == 1);
     Require(umask_nid_postfix(0) == 022);
     Require(umask_nid_postfix(07777) == 0);
@@ -54,6 +127,9 @@ int main() {
     const auto root = std::filesystem::path("anyps5-kernel-sys-test-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Require(std::filesystem::create_directory(root));
+#ifdef _WIN32
+    TestJunction(root);
+#endif
     const auto file = (root / "file.txt").string();
     std::ofstream(file).put('x');
     const int descriptor = open_nid_postfix(file.c_str(), 0, 0);
@@ -155,10 +231,30 @@ int main() {
         const auto dangling = (root / "dangling").string();
 #ifdef _WIN32
         Require((GetFileAttributesW(std::filesystem::path(symbolic).wstring().c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+        std::memset(buffer, '#', sizeof(buffer));
+        Require(readlink_nid_postfix(symbolic.c_str(), buffer, sizeof(buffer)) == 12 && std::memcmp(buffer, "original.bin", 12) == 0 && buffer[12] == '#');
+        Require(readlink_nid_postfix(symbolic.c_str(), buffer, 3) == 3 && std::memcmp(buffer, "ori", 3) == 0);
+        Require(readlink_nid_postfix(symbolic.c_str(), nullptr, 0) == 0);
+        Require(readlink_nid_postfix(symbolic.c_str(), nullptr, sizeof(buffer)) == -1 && Error() == 14);
         Require(symlink_nid_postfix("original.bin", symbolic.c_str()) == -1 && Error() == 17);
         Require(symlink_nid_postfix("missing.bin", dangling.c_str()) == 0);
         Require((GetFileAttributesW(std::filesystem::path(dangling).wstring().c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+        Require(readlink_nid_postfix(dangling.c_str(), buffer, sizeof(buffer)) == 11 && std::memcmp(buffer, "missing.bin", 11) == 0);
         Require(symlink_nid_postfix("missing.bin", dangling.c_str()) == -1 && Error() == 17);
+        const auto unicode = root / "unicode-link";
+        Require(CreateSymbolicLinkW(unicode.c_str(), L"sub\\caf\u00e9-\u732b.txt", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        const std::string unicodeTarget = "sub/caf\xc3\xa9-\xe7\x8c\xab.txt";
+        std::memset(buffer, '#', sizeof(buffer));
+        Require(readlink_nid_postfix(unicode.string().c_str(), buffer, sizeof(buffer)) == static_cast<std::int64_t>(unicodeTarget.size()));
+        Require(std::memcmp(buffer, unicodeTarget.data(), unicodeTarget.size()) == 0 && buffer[unicodeTarget.size()] == '#');
+        std::memset(buffer, '#', sizeof(buffer));
+        Require(readlink_nid_postfix(unicode.string().c_str(), buffer, 8) == 8);
+        Require(std::memcmp(buffer, unicodeTarget.data(), 8) == 0 && buffer[8] == '#');
+        const auto directoryLink = (root / "directory-link").string();
+        Require(symlink_nid_postfix("directory", directoryLink.c_str()) == 0);
+        Require(readlink_nid_postfix(directoryLink.c_str(), buffer, sizeof(buffer)) == 9 && std::memcmp(buffer, "directory", 9) == 0);
+        Require(RemoveDirectoryW(std::filesystem::path(directoryLink).c_str()) != 0);
+        Require(std::filesystem::file_size(root / "directory" / "preserved.txt") == 9);
 #else
         Require(std::filesystem::is_symlink(std::filesystem::symlink_status(symbolic)));
         Require(readlink_nid_postfix(symbolic.c_str(), buffer, sizeof(buffer)) == 12 && std::memcmp(buffer, "original.bin", 12) == 0);
@@ -175,6 +271,7 @@ int main() {
     Require(symlink_nid_postfix("original.bin", (root / "missing" / "symbolic").string().c_str()) == -1 && Error() == 2);
     Require(symlink_nid_postfix(nullptr, symbolic.c_str()) == -1 && Error() == 14);
     Require(symlink_nid_postfix("original.bin", "") == -1 && Error() == 2);
+    Require(std::filesystem::canonical(root).parent_path() == std::filesystem::canonical(std::filesystem::current_path()));
     std::filesystem::remove_all(root);
     return 0;
 }
