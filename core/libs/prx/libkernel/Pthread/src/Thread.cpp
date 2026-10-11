@@ -250,6 +250,30 @@ KernelCpumask LiveGuestThreadsAffinity() {
     return mask;
 }
 
+bool GetGuestThreadAffinity(std::int64_t id, KernelCpumask* mask) {
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    for (const auto& [clockId, thread] : registry.threads) {
+        if (thread->tid == id && !thread->_finished.load(std::memory_order_acquire)) {
+            *mask = thread->affinity.load(std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SetGuestThreadAffinity(std::int64_t id, KernelCpumask mask) {
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    for (const auto& [clockId, thread] : registry.threads) {
+        if (thread->tid == id && !thread->_finished.load(std::memory_order_acquire)) {
+            thread->affinity.store(mask, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos) {
     auto& registry = CpuClocks();
     std::lock_guard lock(registry.lock);
