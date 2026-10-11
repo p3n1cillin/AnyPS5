@@ -27,7 +27,7 @@ const void* APS5_VABI sceFontSelectLibraryFt(int);
 
 static void Check(bool value, int line) {
     if (!value) {
-        std::fprintf(stderr, "Font glyph and text check failed at line %d\n", line);
+        std::fprintf(stderr, "Font text-code check failed at line %d\n", line);
         std::abort();
     }
 }
@@ -132,14 +132,44 @@ static void CheckTextCodes(const FontMemory& memory, FontHandle font) {
     Require(sceFontTextCodesStepBack(step) == &codes && codes.code == 'B' && codes.order == &text[1]);
     Require(sceFontTextCodesStepBack(step) == &codes && codes.code == 'A');
     Require(sceFontTextCodesStepBack(step) == nullptr && codes.code == 'A');
-    step = sceFontCharactersRefersTextCodes(characters + 1, characters + 3, &codes);
+    step = sceFontCharactersRefersTextCodes(characters + 1, characters + 2, &codes);
     Require(step == &codes && codes.code == 'B');
+    Require(sceFontTextCodesStepBack(step) == nullptr && codes.code == 'B');
     Require(sceFontTextCodesStepNext(step) == &codes && codes.code == 'C');
     Require(sceFontTextCodesStepNext(step) == nullptr && codes.code == 'C');
+    Require(sceFontTextCodesStepBack(step) == &codes && codes.code == 'B');
+    Require(sceFontTextCodesStepBack(step) == nullptr && codes.code == 'B');
     step = sceFontCharactersRefersTextCodes(characters + 4, nullptr, &codes);
     Require(sceFontTextCodesStepNext(step) == &codes && codes.code == 0x0301);
     Require(sceFontTextCodesStepNext(step) == nullptr);
-    Require(sceFontCharactersRefersTextCodes(characters + 2, characters + 2, &codes) == nullptr);
+    step = sceFontCharactersRefersTextCodes(characters + 2, characters + 2, &codes);
+    Require(step == &codes && codes.code == 'C' && codes.order == &text[2]);
+    Require(sceFontTextCodesStepNext(step) == nullptr && codes.code == 'C');
+    Require(sceFontTextCodesStepBack(step) == nullptr && codes.code == 'C');
+
+    characters[1].synthetic = 1;
+    characters[2].synthetic = -1;
+    step = sceFontCharactersRefersTextCodes(characters, characters + 4, &codes);
+    Require(sceFontTextCodesStepNext(step) == &codes && codes.code == 0x0E01 && codes.order == &text[3]);
+    Require(sceFontTextCodesStepNext(step) == &codes && codes.code == 'D');
+    Require(sceFontTextCodesStepNext(step) == nullptr && codes.code == 'D');
+    Require(sceFontTextCodesStepBack(step) == &codes && codes.code == 0x0E01);
+    Require(sceFontTextCodesStepBack(step) == &codes && codes.code == 'A');
+    Require(sceFontTextCodesStepBack(step) == nullptr && codes.code == 'A');
+    Require(sceFontCharactersRefersTextCodes(characters + 1, nullptr, &codes) == nullptr && codes.code == 'A');
+    characters[1].synthetic = 0;
+    characters[2].synthetic = 0;
+
+    characters[1].clusterIndex = 1;
+    Require(sceFontCharactersRefersTextCodes(characters + 1, nullptr, &codes) == nullptr && codes.code == 'A');
+    step = sceFontCharactersRefersTextCodes(characters, characters + 2, &codes);
+    Require(sceFontTextCodesStepNext(step) == &codes && codes.code == 'B' && codes.order == &text[1]);
+    Require(sceFontTextCodesStepNext(step) == &codes && codes.code == 'C');
+    Require(sceFontTextCodesStepBack(step) == &codes && codes.code == 'B');
+    characters[1].clusterIndex = 0;
+
+    FontTextCodes uninitialized{};
+    Require(sceFontTextCodesStepNext(&uninitialized) == nullptr && sceFontTextCodesStepBack(&uninitialized) == nullptr);
     Require(sceFontCharactersRefersTextCodes(nullptr, nullptr, &codes) == nullptr);
     Require(sceFontCharactersRefersTextCodes(characters, nullptr, nullptr) == nullptr);
     Require(sceFontTextCodesStepNext(nullptr) == nullptr && sceFontTextCodesStepBack(nullptr) == nullptr);
