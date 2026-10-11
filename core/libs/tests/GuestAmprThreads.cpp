@@ -18,6 +18,8 @@ struct GuestXtime {
 
 extern "C" {
 int APS5_VABI _Thrd_join_nid_postfix(Pthread thread, int* code);
+std::uint32_t APS5_VABI _Thrd_id_nid_postfix(void);
+int APS5_VABI scePthreadGetthreadid(void);
 int APS5_VABI _Thrd_sleep_nid_postfix(const GuestXtime* target, GuestXtime* remaining);
 void APS5_VABI _Lock_shared_ptr_spin_lock_nid_postfix(void);
 void APS5_VABI _Unlock_shared_ptr_spin_lock_nid_postfix(void);
@@ -99,6 +101,51 @@ static Pthread Start(PthreadEntry entry, void* arg) {
     Pthread thread = nullptr;
     Require(scePthreadCreate(&thread, nullptr, entry, arg, nullptr) == 0);
     return thread;
+}
+
+struct ThreadIdContext {
+    std::atomic<int>* ready;
+    std::atomic<bool>* release;
+    std::uint32_t id = 0;
+};
+
+static void* APS5_VABI ReadThreadId(void* arg) {
+    auto& context = *static_cast<ThreadIdContext*>(arg);
+    context.id = _Thrd_id_nid_postfix();
+    Require(context.id != 0 && context.id == static_cast<std::uint32_t>(scePthreadGetthreadid()));
+    context.ready->fetch_add(1);
+    while (!context.release->load()) {
+        Require(_Thrd_id_nid_postfix() == context.id);
+        std::this_thread::yield();
+    }
+    Require(_Thrd_id_nid_postfix() == context.id);
+    return nullptr;
+}
+
+static void TestThreadId() {
+    const auto caller = _Thrd_id_nid_postfix();
+    Require(caller != 0 && caller == static_cast<std::uint32_t>(scePthreadGetthreadid()));
+    constexpr int Count = 8;
+    std::array<Pthread, Count> threads{};
+    std::array<ThreadIdContext, Count + 1> contexts{};
+    std::atomic<int> ready{0};
+    std::atomic<bool> release{false};
+    for (auto& context : contexts) {
+        context.ready = &ready;
+        context.release = &release;
+    }
+    for (int index = 0; index < Count; ++index) threads[index] = Start(ReadThreadId, &contexts[index]);
+    std::thread adopted([&] { ReadThreadId(&contexts[Count]); });
+    while (ready.load() != Count + 1) std::this_thread::yield();
+    Require(_Thrd_id_nid_postfix() == caller);
+    for (std::size_t index = 0; index < contexts.size(); ++index) {
+        Require(contexts[index].id != caller);
+        for (std::size_t previous = 0; previous < index; ++previous) Require(contexts[index].id != contexts[previous].id);
+    }
+    release = true;
+    for (auto thread : threads) Require(_Thrd_join_nid_postfix(thread, nullptr) == ThrdSuccess);
+    adopted.join();
+    Require(_Thrd_id_nid_postfix() == caller);
 }
 
 static void TestThreadJoin() {
@@ -317,6 +364,7 @@ static void TestConditionSignal() {
 }
 
 int main() {
+    TestThreadId();
     TestThreadJoin();
     TestThreadSleep();
     TestSpinLock();
