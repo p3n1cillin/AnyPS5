@@ -9,7 +9,7 @@
 	url = https://github.com/KhronosGroup/SPIRV-Headers.git
 [submodule "3rdparty/SPIRV-Tools"]
 	path = 3rdparty/SPIRV-Tools
-	url = https://github.com/KhronosGroup/SPIRV-Tools.git
+	url = https://github.com/p3n1cillin/SPIRV-Tools.git
 [submodule "3rdparty/glslang"]
 	path = 3rdparty/glslang
 	url = https://github.com/KhronosGroup/glslang.git
