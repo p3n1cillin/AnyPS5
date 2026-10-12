@@ -13,6 +13,10 @@
 
 - Windows direct-memory backing reserves a paging-file section and commits each mapped guest page before setting its protection. Committed physical contents remain in the section across unmap/remap and are released when the backing and its remaining views are destroyed; commitment is not recovered merely by unmapping a page. Linux retains its existing backing. Peak gameplay memory and Windows versions other than the tested host remain unverified.
 
+### Shader memory
+
+- [Cached source IR](../../core/shader/recompiler/Recompiler.cpp) clears completed SSA construction tables and releases values unreachable from instructions, metadata and resource plans before caching a source program. Reclamation must account for every new IR pointer owner; a remaining external use throws. Live IDs are retained. Source and variant entries remain cached without an eviction bound. A pending source program is released after its first variant is obtained; peak gameplay memory and Linux performance remain unmeasured.
+
 ### Silent stubs
 
 Throughout the project, every function at every stage either **does exactly what it's supposed to or throws an exception**. Everywhere... except:

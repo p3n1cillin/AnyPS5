@@ -306,7 +306,20 @@ public:
 };
 
 struct ResourceProgram {
-    explicit ResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr) : program(std::make_unique<IrProgram>(PrepareResourceProgram(request, preparation))), plan(std::make_shared<const IrResourcePlan>(ResourceMaterializer{}.ExtractPlan(*program))) {}
+    explicit ResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr) : program(std::make_unique<IrProgram>(PrepareResourceProgram(request, preparation))) {
+        const auto clearRegisterState = [](const auto& storage) {
+            for (const auto& block : storage) {
+                block->ssaScalarValues.fill(nullptr);
+                block->ssaVectorValues.fill(nullptr);
+                block->ssaThreadBitScalarValues.fill(nullptr);
+                block->ssaScalarMaskTags.fill(nullptr);
+            }
+        };
+        clearRegisterState(program->Blocks());
+        clearRegisterState(program->Resources().blockStorage);
+        program->ReclaimUnusedValues();
+        plan = std::make_shared<const IrResourcePlan>(ResourceMaterializer{}.ExtractPlan(*program));
+    }
 
     std::unique_ptr<IrProgram> program;
     std::shared_ptr<const IrResourcePlan> plan;
