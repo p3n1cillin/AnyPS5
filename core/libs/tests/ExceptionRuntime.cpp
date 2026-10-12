@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -33,6 +34,7 @@ extern "C" _Unwind_Reason_Code _Unwind_Backtrace_nid_postfix(_Unwind_Trace_Fn, v
 extern "C" _Unwind_Reason_Code _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception*, _Unwind_Stop_Fn, void*);
 extern "C" std::uintptr_t _Unwind_GetIP_nid_postfix(_Unwind_Context*);
 extern "C" void (*_ZSt13set_terminatePFvvE_nid_postfix(void(*)()))();
+extern "C" [[noreturn]] void __cxa_call_unexpected_nid_postfix(void*);
 
 thread_local int destroyed = 0;
 struct Guard {
@@ -162,6 +164,22 @@ void CheckTerminate(void (*function)()) {
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 61);
 }
+void CheckCallUnexpected() {
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        _ZSt13set_terminatePFvvE_nid_postfix([] { _exit(__cxa_current_primary_exception_nid_postfix() ? 61 : 60); });
+        std::exception_ptr made = std::make_exception_ptr(17);
+        void* object;
+        std::memcpy(&object, &made, sizeof(object));
+        assert(!__cxa_current_primary_exception_nid_postfix());
+        __cxa_call_unexpected_nid_postfix(static_cast<unsigned char*>(object) - sizeof(_Unwind_Exception));
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 61);
+}
+
 void CheckDefaultTerminateMessage() {
     const std::string message = std::string(3000, 'w') + " end of message";
     int channel[2];
@@ -255,6 +273,7 @@ int main() {
     CheckTerminate(UncaughtThrow);
     CheckTerminate(NoexceptThrow);
     CheckDefaultTerminateMessage();
+    CheckCallUnexpected();
     CheckForcedUnwind();
     int frames = 0;
     auto backtrace = _Unwind_Backtrace_nid_postfix([](_Unwind_Context* context, void* argument) {
