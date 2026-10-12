@@ -30,8 +30,24 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
     const auto capture = [&] {
-        const SampledReadScope sampling(evidenceReads);
-        return shaderMemory.Capture(invocation);
+        try {
+            const SampledReadScope sampling(evidenceReads);
+            return shaderMemory.Capture(invocation);
+        } catch (...) {
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) {
+                try {
+                    const auto failedMemory = shaderMemory.Regions();
+                    auto failedRequest = request;
+                    failedRequest.context.memory = failedMemory;
+                    const auto file = dumpRequest(program.binary.codeAddress, failedRequest);
+                    std::fprintf(stderr, "[draw-capture] failed shader 0x%llx stage %u: %zu captured regions, request %s\n",
+                        static_cast<unsigned long long>(program.binary.codeAddress), static_cast<unsigned>(program.binary.stage), failedMemory.size(), file.empty() ? "unavailable" : file.c_str());
+                } catch (const std::exception& dumpError) {
+                    std::fprintf(stderr, "[draw-capture] could not preserve failed shader 0x%llx: %s\n", static_cast<unsigned long long>(program.binary.codeAddress), dumpError.what());
+                }
+            }
+            throw;
+        }
     }();
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
