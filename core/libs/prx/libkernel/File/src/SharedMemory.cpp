@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <system_error>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -249,13 +250,22 @@ int CreateAnonymousFile() {
     const auto seed = std::to_string(std::random_device{}());
     for (int attempt = 0; attempt < 64; ++attempt) {
         const auto path = directory / ("anyps5-shm-" + seed + "-" + std::to_string(sequence++));
-        int descriptor = -1;
-        const int error = _wsopen_s(&descriptor, path.c_str(),
-                                    _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY | _O_TEMPORARY | _O_SHORT_LIVED | _O_NOINHERIT,
-                                    _SH_DENYNO, _S_IREAD | _S_IWRITE);
-        if (error == 0) return descriptor;
-        if (error != EEXIST) {
-            errno = error;
+        const auto handle = ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            const int descriptor = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_RDWR | _O_BINARY | _O_NOINHERIT);
+            if (descriptor < 0) {
+                const int error = errno;
+                ::CloseHandle(handle);
+                errno = error;
+            }
+            return descriptor;
+        }
+        const auto error = ::GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
+            const auto condition = std::system_category().default_error_condition(static_cast<int>(error));
+            errno = condition.category() == std::generic_category() ? condition.value() : EIO;
             return -1;
         }
     }

@@ -31,6 +31,7 @@
 #include <vector>
 #else
 #include <windows.h>
+#include <io.h>
 
 static constexpr int PROT_NONE = 0;
 static constexpr int PROT_READ = 1;
@@ -129,7 +130,9 @@ static int mprotect(void* addr, size_t len, int prot) {
         const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
         if (memory.State == MEM_COMMIT) {
             DWORD old;
-            if (!VirtualProtect(reinterpret_cast<void*>(cursor), regionEnd - cursor, WinProtFromPosix(prot), &old))
+            std::uint32_t effective = WinProtFromPosix(prot);
+            GuestArena::GuestArenaProtection_nid_postfix(cursor, &effective);
+            if (!VirtualProtect(reinterpret_cast<void*>(cursor), regionEnd - cursor, effective, &old))
                 throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualProtect failed");
         } else if (prot != PROT_NONE) {
             throw std::runtime_error("mprotect of uncommitted memory outside the guest arena");
@@ -144,6 +147,45 @@ namespace {
 
 constexpr int GuestMapFixedFlag = 0x10;
 constexpr int GuestProtGpuReadWrite = 0x30;
+
+#ifdef _WIN32
+class FileSection {
+public:
+    FileSection(int descriptor, bool shared, std::uint64_t offset, std::size_t bytes) {
+        const auto file = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+        if (file == INVALID_HANDLE_VALUE) throw std::system_error(EBADF, std::generic_category(), "invalid guest file mapping descriptor");
+        FILE_REMOTE_PROTOCOL_INFO remote{};
+        if (::GetFileInformationByHandleEx(file, FileRemoteProtocolInfo, &remote, sizeof(remote))) throw std::system_error(ENOTSUP, std::generic_category(), "remote guest file mappings are not supported");
+        LARGE_INTEGER size{};
+        if (!::GetFileSizeEx(file, &size)) throw std::system_error(EIO, std::generic_category(), "query guest mapping file size");
+        if (size.QuadPart <= 0 || offset + bytes > static_cast<std::uint64_t>(size.QuadPart)) throw std::system_error(ENOTSUP, std::generic_category(), "guest file mapping extends past EOF");
+        const DWORD candidates[]{PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_EXECUTE_READ, PAGE_READONLY};
+        for (const auto protection : candidates) {
+            if (!shared && (protection == PAGE_EXECUTE_READWRITE || protection == PAGE_READWRITE)) continue;
+            section = ::CreateFileMappingW(file, nullptr, protection, 0, 0, nullptr);
+            if (section != nullptr) {
+                writable = protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE;
+                executable = protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE;
+                return;
+            }
+            const auto error = ::GetLastError();
+            if (error != ERROR_ACCESS_DENIED) throw std::system_error(error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ? ENOMEM : EIO, std::generic_category(), "create guest file mapping section");
+        }
+        throw std::system_error(EACCES, std::generic_category(), "guest file mapping access denied");
+    }
+    ~FileSection() { if (section != nullptr) ::CloseHandle(section); }
+    FileSection(const FileSection&) = delete;
+    FileSection& operator=(const FileSection&) = delete;
+    void Map(void* address, std::size_t bytes, std::uint64_t offset, int protection, bool shared) const {
+        GuestArena::GuestArenaMapFile_nid_no_patch(address, bytes, section, offset, WinProtFromPosix(protection), !shared, writable, executable);
+    }
+
+private:
+    HANDLE section = nullptr;
+    bool writable = false;
+    bool executable = false;
+};
+#endif
 
 #if defined(__linux__)
 void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
@@ -833,8 +875,11 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
 int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, int descriptor, std::uint64_t offset, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || (offset & (PS5_PAGE_SIZE - 1)) != 0 || len > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) || offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - len) return SCE_KERNEL_ERROR_EINVAL;
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     const bool shared = (flags & 3) == 1;
+#ifdef _WIN32
+    FileSection section(descriptor, shared, offset, len);
+#endif
     GuestAllocations::Mutation mutation;
     const int placementFlags = flags & (GuestMapFixedFlag | 0x80 | 0x400000);
     flags = PlaceHintInReservation(*addr, len, placementFlags);
@@ -842,6 +887,7 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
     ReplaceFixedOverlap(mutation, *addr, len, flags);
     void* mapped = MapPlaced(*addr, len, PROT_NONE, flags, alignment);
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(mapped, len);
+#if defined(__linux__)
     const int nativeProtection = LinuxProtFromSce(prot);
     const int nativeFlags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED;
     if (::mmap(mapped, len, nativeProtection, nativeFlags, descriptor, static_cast<off_t>(offset)) == MAP_FAILED) {
@@ -849,6 +895,14 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
         Unmap(mapped, len);
         throw std::system_error(error, std::generic_category(), "map guest shared memory");
     }
+#else
+    try {
+        section.Map(mapped, len, offset, prot, shared);
+    } catch (...) {
+        Unmap(mapped, len);
+        throw;
+    }
+#endif
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
     } catch (...) {

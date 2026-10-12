@@ -23,6 +23,12 @@ int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64
 int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
 int APS5_VABI sceKernelMunmap(void*, std::size_t);
 int APS5_VABI sceKernelMprotect(const void*, std::size_t, int);
+int APS5_VABI shm_open_nid_postfix(const char*, int, int);
+int APS5_VABI ftruncate_nid_postfix(int, std::int64_t);
+std::int64_t APS5_VABI pread_nid_postfix(int, void*, std::size_t, std::int64_t);
+std::int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int, const void*, std::size_t, std::int64_t);
+void* APS5_VABI mmap_nid_postfix(void*, std::size_t, int, int, int, std::int64_t) noexcept;
+int APS5_VABI close_nid_postfix(int);
 }
 
 namespace {
@@ -257,6 +263,38 @@ void run() {
     for (unsigned i = 0; i < 8; ++i) require(std::all_of(bytes + i * part, bytes + (i + 1) * part, [i](auto x) { return x == static_cast<std::byte>(i + 57); }), "concurrent write differs");
 }
 
+void FileMappings() {
+    constexpr std::size_t page = 0x4000;
+    const int descriptor = shm_open_nid_postfix(reinterpret_cast<const char*>(1), 2, 0600);
+    require(descriptor >= 0 && ftruncate_nid_postfix(descriptor, page) == 0, "file mapping setup failed");
+    auto* shared = static_cast<std::byte*>(mmap_nid_postfix(nullptr, page, 3, 1, descriptor, 0));
+    auto* copy = static_cast<std::byte*>(mmap_nid_postfix(nullptr, page, 3, 2, descriptor, 0));
+    require(shared != reinterpret_cast<void*>(-1) && copy != reinterpret_cast<void*>(-1), "driver file mapping creation failed");
+    const auto sharedAddress = reinterpret_cast<std::uint64_t>(shared);
+    const auto copyAddress = reinterpret_cast<std::uint64_t>(copy);
+    const std::array privateBytes{std::byte{11}, std::byte{12}, std::byte{13}, std::byte{14}};
+    Write(copyAddress, privateBytes, 1);
+    require(std::equal(privateBytes.begin(), privateBytes.end(), copy), "driver private write was not visible");
+    require(shared[0] == std::byte{0}, "driver private write escaped into shared view");
+    std::array<std::byte, 4> back{};
+    require(pread_nid_postfix(descriptor, back.data(), back.size(), 0) == 4 && back[0] == std::byte{0}, "driver private write escaped into file");
+    const std::array sharedBytes{std::byte{21}, std::byte{22}, std::byte{23}, std::byte{24}};
+    Write(sharedAddress, sharedBytes, 1);
+    require(pread_nid_postfix(descriptor, back.data(), back.size(), 0) == 4 && back == sharedBytes, "driver shared write did not change file");
+    Read(copyAddress, back, 1);
+    require(back == privateBytes, "driver shared write changed private copy");
+    const std::array descriptorBytes{std::byte{31}, std::byte{32}, std::byte{33}, std::byte{34}};
+    require(pwrite_nid_disambig1_nid_postfix(descriptor, descriptorBytes.data(), descriptorBytes.size(), 0) == 4, "descriptor write failed");
+    BumpCollectEpoch();
+    Read(sharedAddress, back, 1);
+    require(back == descriptorBytes, "driver read missed descriptor write");
+    require(close_nid_postfix(descriptor) == 0, "driver file descriptor close failed");
+    Read(sharedAddress, back, 1);
+    require(back == descriptorBytes, "driver read failed after descriptor close");
+    require(sceKernelMunmap(shared, page) == 0 && sceKernelMunmap(copy, page) == 0, "driver file view cleanup failed");
+    std::cout << "Driver file mapping write checks passed\n";
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -268,6 +306,7 @@ int main(int argc, char** argv) {
             }
             partialCollect();
         }
+        else if (argc == 2 && std::string_view(argv[1]) == "--file-mappings") FileMappings();
         else if (argc == 2 && std::string_view(argv[1]) == "--benchmark") benchmark();
         else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-labels") benchmark(true);
         else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-fallback") benchmark(false, false);
