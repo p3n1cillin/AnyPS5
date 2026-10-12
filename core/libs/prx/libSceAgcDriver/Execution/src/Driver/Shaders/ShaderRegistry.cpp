@@ -19,10 +19,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <list>
 #include <atomic>
 #include <pthread.h>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -30,14 +32,25 @@
 namespace AgcDriver::DriverDetail {
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
+    std::exception_ptr failure;
+    std::string dump;
     try {
         auto handle = ShaderRecompiler::PrepareShader(request, preparation);
         return handle;
     } catch (...) {
+        failure = std::current_exception();
         try {
-            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) dump = Driver::dumpRequest(request.shader.codeAddress, request);
         } catch (...) {}
-        throw;
+    }
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+        std::ostringstream where;
+        where << "shader 0x" << std::hex << request.shader.codeAddress << " stage " << static_cast<unsigned>(request.shader.stage);
+        if (!dump.empty()) where << " (" << dump << ")";
+        where << ": ";
+        throw std::runtime_error(where.str() + error.what());
     }
 }
 

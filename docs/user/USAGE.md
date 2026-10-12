@@ -133,6 +133,8 @@ Games ask for the console's language with `sceSystemServiceParamGetInt` and show
 
 The game runs on the first Vulkan 1.1 device with graphics and compute queues and swapchain presentation, preferring a discrete GPU over an integrated one. Set `ANYPS5_GPU` to a part of a device name, compared without regard to case, to run on another device; the names are printed at start-up in the `Physical device candidate` lines. When no usable device contains the text, the start fails and the error lists the device names.
 
+The window presents with vertical sync (`fifo`). Set `ANYPS5_PRESENT_MODE` to `fifo_latest_ready`, `mailbox` or `immediate` to keep the game from waiting for the display: `fifo_latest_ready` and `mailbox` still show whole frames at the display's refresh and drop the ones in between, `immediate` presents at once and can tear. The start fails on any other value and when the surface does not offer the mode (`fifo_latest_ready` needs `VK_KHR_present_mode_fifo_latest_ready` or its EXT form). Flips stay paced at 59.94 Hz in every mode. A Wayland compositor can stop delivering frames to a window it does not show, for example one on another workspace: on Hyprland with the NVIDIA driver a `fifo` swapchain then presents about once per second, while `fifo_latest_ready` and `immediate` keep the game at its normal rate.
+
 On Windows, the OpenCL, OpenGL, and Vulkan Compatibility Pack can install Mesa Dozen, which exposes D3D12 devices through Vulkan. Some D3D12 drivers can crash while the Vulkan loader enumerates adapters, even when AnyPS5 would select a native Vulkan device. If this happens and the system has another Vulkan driver, disable Dozen for the current PowerShell session before launching AnyPS5:
 
 ```powershell

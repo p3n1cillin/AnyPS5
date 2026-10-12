@@ -60,11 +60,13 @@ int APS5_VABI sceKernelSetVirtualRangeName(const void*, std::uint64_t, const cha
 int APS5_VABI sceKernelClearVirtualRangeName(const void*, std::uint64_t);
 int APS5_VABI sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int, std::int64_t*);
 int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
+int APS5_VABI sceKernelEnableDmemAliasing();
 int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
 int APS5_VABI sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*, std::size_t*);
 int APS5_VABI sceKernelCheckedReleaseDirectMemory(std::int64_t, std::size_t);
 int APS5_VABI sceKernelReserveVirtualRange(void**, std::size_t, int, std::size_t);
 int APS5_VABI sceKernelMemoryPoolReserve(void*, std::size_t, std::size_t, int, void**);
+int APS5_VABI sceKernelMemoryPoolCommit(void*, std::size_t, int, int, int);
 int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
 int APS5_VABI sceKernelClose(int);
 std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
@@ -252,6 +254,7 @@ static void CheckDirectMemoryFollowsPhysicalPages() {
     Require(sceKernelMapDirectMemory(&first, page * 2, 3, 0, phys, 0) == 0);
     static_cast<unsigned char*>(first)[0] = 11;
     static_cast<unsigned char*>(first)[page + 5] = 22;
+    Require(sceKernelEnableDmemAliasing() == 0);
     void* alias = nullptr;
     Require(sceKernelMapDirectMemory(&alias, page, 3, 0, phys + page, 0) == 0);
     Require(alias != first && static_cast<unsigned char*>(alias)[5] == 22);
@@ -289,6 +292,34 @@ static void CheckDirectMemoryFollowsPhysicalPages() {
     Require(sceKernelMunmap(fresh, page * 2) == 0);
     Require(sceKernelMunmap(filler, page * 2) == 0);
     Require(sceKernelReleaseDirectMemory(again, page * 2) == 0);
+}
+
+static void CheckSparseDirectMemoryBacking() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t size = 256u * 1024u * 1024u;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, size, 0, 0, &physical) == 0);
+    void* first = nullptr;
+    void* last = nullptr;
+    Require(sceKernelMapDirectMemory(&first, page, 3, 0, physical, 0) == 0);
+    Require(sceKernelMapDirectMemory(&last, page, 3, 0, physical + size - page, 0) == 0);
+    auto* firstBytes = static_cast<unsigned char*>(first);
+    auto* lastBytes = static_cast<unsigned char*>(last);
+    Require(firstBytes[0] == 0 && firstBytes[page - 1] == 0 && lastBytes[0] == 0 && lastBytes[page - 1] == 0);
+    firstBytes[0] = 17;
+    lastBytes[page - 1] = 29;
+    void* alias = nullptr;
+    Require(sceKernelMapDirectMemory(&alias, page, 3, 0, physical + size - page, 0) == 0);
+    auto* aliasBytes = static_cast<unsigned char*>(alias);
+    Require(aliasBytes[page - 1] == 29 && aliasBytes[0] == 0);
+    aliasBytes[page - 1] = 41;
+    Require(lastBytes[page - 1] == 41 && firstBytes[0] == 17);
+    Require(sceKernelMunmap(last, page) == 0 && sceKernelMunmap(alias, page) == 0);
+    last = nullptr;
+    Require(sceKernelMapDirectMemory(&last, page, 3, 0, physical + size - page, 0) == 0);
+    Require(static_cast<unsigned char*>(last)[page - 1] == 41);
+    Require(sceKernelMunmap(first, page) == 0 && sceKernelMunmap(last, page) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, size) == 0);
 }
 
 static void CheckReleaseDirectMemoryClearsMappings() {
@@ -448,6 +479,19 @@ static void CheckMtypeprotect() {
     Require(sceKernelMemoryPoolBatch(&poolEntry, 1, &processed, 0) == 0 && processed == 1);
     check(1, 3, 1);
     check(2, 4, 1);
+    Require(sceKernelMemoryPoolCommit(bytes + page * 2, page, 6, 3, 0) == 0);
+    check(2, 6, 3);
+    check(1, 3, 1);
+    KernelMemoryPoolBatchEntry commitEntry{};
+    commitEntry.op = 1;
+    commitEntry.commit.addr = bytes + page * 2;
+    commitEntry.commit.len = page;
+    commitEntry.commit.prot = 1;
+    commitEntry.commit.type = 7;
+    processed = -1;
+    Require(sceKernelMemoryPoolBatch(&commitEntry, 1, &processed, 0) == 0 && processed == 1);
+    check(1, 3, 1);
+    check(2, 7, 1);
     Require(sceKernelMtypeprotect(bytes, page * 3, 2, 3) == 0);
     VirtualQueryInfo whole{};
     Require(sceKernelVirtualQuery(bytes, 0, &whole, sizeof(whole)) == 0);
@@ -1834,6 +1878,7 @@ int main() {
     CheckCheckedReleaseDirectMemory();
     CheckAudioCoprocessorProtection();
     CheckDirectMemoryFollowsPhysicalPages();
+    CheckSparseDirectMemoryBacking();
     CheckReleaseDirectMemoryClearsMappings();
     CheckReleaseDirectMemoryRejectsInvalidRanges();
     CheckFixedMappingReplacesPartialOverlap();
