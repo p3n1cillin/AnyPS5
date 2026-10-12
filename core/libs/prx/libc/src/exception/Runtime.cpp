@@ -421,6 +421,10 @@ void* __dynamic_cast_nid_postfix(const void* source, const __cxxabiv1::__class_t
     __cxa_begin_catch_nid_postfix(exception);
     LibcException::Terminate();
 }
+[[noreturn]] void APS5_VABI __cxa_call_unexpected_nid_postfix(void* exception) {
+    __cxa_begin_catch_nid_postfix(exception);
+    LibcException::Terminate();
+}
 [[noreturn]] void APS5_VABI __cxa_pure_virtual_nid_postfix() { LibcException::Terminate(); }
 [[noreturn]] void APS5_VABI __cxa_deleted_virtual_nid_postfix() { LibcException::Terminate(); }
 }

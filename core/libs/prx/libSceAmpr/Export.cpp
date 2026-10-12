@@ -930,11 +930,6 @@ int APS5_VABI wcstombs_s_nid_postfix(std::size_t* result, char* destination, std
     return wcsrtombs_s_nid_postfix(result, destination, capacity, &source, limit, state.data());
 }
 
-int APS5_VABI __cxa_call_unexpected_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 APS5_EXPORT("0hlfW1O4Aa4", sceAmprLocaleconv);
 SonyLconv* APS5_VABI sceAmprLocaleconv(void) {
     return SonyLocaleconv();
