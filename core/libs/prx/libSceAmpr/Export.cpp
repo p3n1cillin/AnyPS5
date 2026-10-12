@@ -873,11 +873,6 @@ int APS5_VABI _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI _ZNSt7num_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI _Cnd_signal_nid_postfix(void** handle) {
     return SignalCondition_nid_no_patch(handle);
 }
@@ -901,11 +896,6 @@ int APS5_VABI _ZTVSt7num_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE_nid_
 }
 
 int APS5_VABI _ZNKSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE3getES3_S3_RSt8ios_baseRNSt5_IosbIiE8_IostateEP2tmPKcSE__nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI _ZNSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
