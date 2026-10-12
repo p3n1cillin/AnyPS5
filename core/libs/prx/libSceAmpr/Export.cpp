@@ -890,11 +890,6 @@ int APS5_VABI _Cnd_init_with_name_nid_postfix(void** handle, const char*) {
     return _Cnd_init_nid_postfix(handle);
 }
 
-int APS5_VABI _ZTVN10__cxxabiv120__function_type_infoE_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI _ZTVSt7num_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -906,11 +901,6 @@ int APS5_VABI _ZNKSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE3get
 }
 
 int APS5_VABI _ZNSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI _ZTVN10__cxxabiv119__pointer_type_infoE_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

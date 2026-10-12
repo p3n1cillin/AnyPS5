@@ -33,6 +33,10 @@ extern "C" _Unwind_Reason_Code _Unwind_Backtrace_nid_postfix(_Unwind_Trace_Fn, v
 extern "C" _Unwind_Reason_Code _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception*, _Unwind_Stop_Fn, void*);
 extern "C" std::uintptr_t _Unwind_GetIP_nid_postfix(_Unwind_Context*);
 extern "C" void (*_ZSt13set_terminatePFvvE_nid_postfix(void(*)()))();
+extern "C" const unsigned char _ZTVN10__cxxabiv117__class_type_infoE_nid_postfix[];
+extern "C" const unsigned char _ZTVN10__cxxabiv120__si_class_type_infoE_nid_postfix[];
+extern "C" const unsigned char _ZTVN10__cxxabiv119__pointer_type_infoE_nid_postfix[];
+extern "C" const unsigned char _ZTVN10__cxxabiv120__function_type_infoE_nid_postfix[];
 
 thread_local int destroyed = 0;
 struct Guard {
@@ -83,6 +87,50 @@ void CheckRtti() {
     try { throw &pointer; }
     catch (const int* const* p) { assert(**p == value); }
 }
+void CheckGuestPointerTypeInfo() {
+    struct TypeRecord { const void* vtable; const char* name; };
+    struct SingleRecord { TypeRecord type; const TypeRecord* base; };
+    struct PointerRecord { TypeRecord type; unsigned flags; const TypeRecord* pointee; };
+    const auto* classTable = _ZTVN10__cxxabiv117__class_type_infoE_nid_postfix;
+    const auto* singleTable = _ZTVN10__cxxabiv120__si_class_type_infoE_nid_postfix;
+    const auto* pointerTable = _ZTVN10__cxxabiv119__pointer_type_infoE_nid_postfix;
+    const auto* functionTable = _ZTVN10__cxxabiv120__function_type_infoE_nid_postfix;
+    const unsigned char* tables[] {pointerTable, functionTable};
+    const char* names[] {"N10__cxxabiv119__pointer_type_infoE", "N10__cxxabiv120__function_type_infoE"};
+    using KindQuery = bool (*)(const void*);
+    for (std::size_t i = 0; i < 2; ++i) {
+        const std::type_info* category;
+        std::memcpy(&category, tables[i] + sizeof(void*), sizeof(category));
+        assert(std::strcmp(category->name(), names[i]) == 0);
+        KindQuery isPointer, isFunction;
+        std::memcpy(&isPointer, tables[i] + 4 * sizeof(void*), sizeof(isPointer));
+        std::memcpy(&isFunction, tables[i] + 5 * sizeof(void*), sizeof(isFunction));
+        assert(isPointer(nullptr) == (i == 0) && isFunction(nullptr) == (i == 1));
+    }
+    TypeRecord base {classTable + 2 * sizeof(void*), "4Base"};
+    TypeRecord other {classTable + 2 * sizeof(void*), "5Other"};
+    TypeRecord voidType {classTable + 2 * sizeof(void*), "v"};
+    SingleRecord single {{singleTable + 2 * sizeof(void*), "6Single"}, &base};
+    TypeRecord function {functionTable + 2 * sizeof(void*), "FvvE"};
+    PointerRecord basePointer {{pointerTable + 2 * sizeof(void*), "P4Base"}, 0, &base};
+    PointerRecord otherPointer {{pointerTable + 2 * sizeof(void*), "P5Other"}, 0, &other};
+    PointerRecord singlePointer {{pointerTable + 2 * sizeof(void*), "P6Single"}, 0, &single.type};
+    PointerRecord voidPointer {{pointerTable + 2 * sizeof(void*), "Pv"}, 0, &voidType};
+    PointerRecord functionPointer {{pointerTable + 2 * sizeof(void*), "PFvvE"}, 0, &function};
+    using CatchType = bool (*)(const void*, const void*, void**, unsigned);
+    CatchType catchType;
+    std::memcpy(&catchType, pointerTable + 6 * sizeof(void*), sizeof(catchType));
+    unsigned char storage[16] {};
+    void* object = storage;
+    assert(catchType(&basePointer, &singlePointer, &object, 0) && object == storage);
+    object = storage;
+    assert(!catchType(&otherPointer, &singlePointer, &object, 0));
+    object = storage;
+    assert(catchType(&voidPointer, &singlePointer, &object, 0));
+    object = storage;
+    assert(!catchType(&voidPointer, &functionPointer, &object, 0));
+}
+
 int foreignDeleted;
 void CheckForeign() {
     auto* exception = new _Unwind_Exception {};
@@ -202,6 +250,7 @@ void CheckForcedUnwind() {
 }
 
 int main() {
+    CheckGuestPointerTypeInfo();
     try { ThrowInt(); assert(false); } catch (int value) { assert(value == 42); }
     assert(destroyed == 1);
     try { ThrowClass(); assert(false); } catch (const Base& value) { assert(value.value == 7); }
