@@ -225,7 +225,7 @@ static std::atomic_flag sharedPtrSpinLock;
 
 extern "C" {
 int APS5_VABI pthread_join_nid_postfix(Pthread thread, void** value);
-int APS5_VABI scePthreadGetthreadid(void);
+Pthread APS5_VABI scePthreadSelf(void);
 int APS5_VABI wcsrtombs_s_nid_postfix(std::size_t* result, char* destination, std::size_t capacity, const std::uint16_t** source, std::size_t limit, void* state);
 int APS5_VABI _Cnd_init_nid_postfix(void** handle);
 int SignalCondition_nid_no_patch(void** handle);
@@ -864,8 +864,8 @@ int APS5_VABI _ZNSt4_PadD2Ev_nid_postfix(void) {
     return 0;
 }
 
-std::uint32_t APS5_VABI _Thrd_id_nid_postfix(void) {
-    return static_cast<std::uint32_t>(scePthreadGetthreadid());
+Pthread APS5_VABI _Thrd_id_nid_postfix(void) {
+    return scePthreadSelf();
 }
 
 int APS5_VABI _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(void) {
