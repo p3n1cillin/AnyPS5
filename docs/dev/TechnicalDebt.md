@@ -15,6 +15,7 @@
 
 ### Shader memory
 
+- System SPIRV-Tools versions that retain completed redundancy-elimination state maps can consume excessive memory during shader compilation. The bundled version releases each map after its child states are copied; system builds depend on the installed library's implementation.
 - [Cached source IR](../../core/shader/recompiler/Recompiler.cpp) clears completed SSA construction tables and releases values unreachable from instructions, metadata and resource plans before caching a source program. Reclamation must account for every new IR pointer owner; a remaining external use throws. Live IDs are retained. Source and variant entries remain cached without an eviction bound. A pending source program is released after its first variant is obtained; peak gameplay memory and Linux performance remain unmeasured.
 
 ### Silent stubs
