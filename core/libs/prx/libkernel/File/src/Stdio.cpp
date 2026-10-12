@@ -92,7 +92,8 @@ static int NativeFchmod(int descriptor, int mode) {
 }
 static int NativeFtruncate(int descriptor, std::int64_t length) {
     const int result = File::TruncateSharedMemory_nid_no_patch(descriptor, length);
-    return result == -2 ? static_cast<int>(::_chsize_s(descriptor, length)) : result;
+    if (result == -2) return static_cast<int>(::_chsize_s(descriptor, length));
+    return result < 0 ? errno : result;
 }
 static int NativeTruncate(const std::filesystem::path& path, std::int64_t length) {
     const int descriptor = ::_wopen(path.c_str(), _O_WRONLY | _O_BINARY);
@@ -157,12 +158,15 @@ static int NativeFlock(int descriptor, int operation) {
     return File::Flock(descriptor, operation);
 }
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
-    if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
-        throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
-    }
     if (write) {
         const auto result = File::PwriteSharedMemory_nid_no_patch(descriptor, buf, nbytes, offset);
         if (result != -2) return result;
+    }
+    return NativePositionedRaw_nid_no_patch(descriptor, buf, nbytes, offset, write);
+}
+std::int64_t NativePositionedRaw_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
+    if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
+        throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
     }
     const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
     if (handle == INVALID_HANDLE_VALUE) {

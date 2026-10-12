@@ -14,6 +14,8 @@
 #include <limits>
 #include <optional>
 #include <atomic>
+#include <cstring>
+#include <mutex>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -22,6 +24,7 @@
 #include <sys/stat.h>
 #include <filesystem>
 #include <random>
+#include <windows.h>
 #else
 #include "nid/Sha1.hpp"
 #include <fcntl.h>
@@ -34,11 +37,58 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+#ifdef _WIN32
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+#endif
 
 namespace {
 
+#ifdef _WIN32
+std::mutex hostShmMutex;
+
+void IgnoreDescriptorParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
+
+template <typename TCall> auto WithoutDescriptorParameterHandler(TCall call) {
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreDescriptorParameter);
+    const auto result = call();
+    _set_thread_local_invalid_parameter_handler(previous);
+    return result;
+}
+
+HANDLE DescriptorHandle(int descriptor) {
+    if (descriptor < 0) return INVALID_HANDLE_VALUE;
+    return reinterpret_cast<HANDLE>(WithoutDescriptorParameterHandler([descriptor] { return ::_get_osfhandle(descriptor); }));
+}
+
+bool DescriptorIdentity(int descriptor, FILE_ID_INFO& identity) {
+    const auto handle = DescriptorHandle(descriptor);
+    return handle != INVALID_HANDLE_VALUE && ::GetFileInformationByHandleEx(handle, FileIdInfo, &identity, sizeof(identity));
+}
+
+bool SameIdentity(const FILE_ID_INFO& first, const FILE_ID_INFO& second) {
+    return first.VolumeSerialNumber == second.VolumeSerialNumber &&
+        std::memcmp(first.FileId.Identifier, second.FileId.Identifier, sizeof(first.FileId.Identifier)) == 0;
+}
+#endif
+
 bool IsHostSharedMemoryDescriptor(int descriptor) {
-#ifdef __linux__
+#ifdef _WIN32
+    const auto handle = DescriptorHandle(descriptor);
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (handle == INVALID_HANDLE_VALUE || !::GetFileInformationByHandle(handle, &information) ||
+        (information.dwFileAttributes & FILE_ATTRIBUTE_TEMPORARY) == 0) return false;
+    std::wstring path(MAX_PATH, L'\0');
+    auto length = ::GetFinalPathNameByHandleW(handle, path.data(), static_cast<DWORD>(path.size()), FILE_NAME_OPENED | VOLUME_NAME_NONE);
+    if (length >= path.size()) {
+        path.resize(length);
+        length = ::GetFinalPathNameByHandleW(handle, path.data(), static_cast<DWORD>(path.size()), FILE_NAME_OPENED | VOLUME_NAME_NONE);
+    }
+    if (length == 0 || length >= path.size()) return false;
+    path.resize(length);
+    const auto separator = path.find_last_of(L'\\');
+    const std::wstring_view name(path.data() + (separator == std::wstring::npos ? 0 : separator + 1));
+    return name.starts_with(L"anyps5-shm-");
+#elif defined(__linux__)
     char descriptorPath[64];
     std::snprintf(descriptorPath, sizeof(descriptorPath), "/proc/self/fd/%d", descriptor);
     char objectPath[4096];
@@ -76,6 +126,9 @@ public:
     int Error() const { return error; }
 
 private:
+#ifdef _WIN32
+    std::unique_lock<std::mutex> lock{hostShmMutex};
+#endif
     int descriptor = -1;
     int error = 0;
 };
@@ -227,12 +280,21 @@ namespace {
 class SharedMemoryLock {
 public:
     explicit SharedMemoryLock(int value) {
-#ifdef __linux__
+#ifdef _WIN32
+        FILE_ID_INFO originalIdentity{};
+        const bool identified = DescriptorIdentity(value, originalIdentity);
+#elif defined(__linux__)
         struct stat originalStatus{};
         if (::fstat(value, &originalStatus) != 0) { shared = true; error = errno; return; }
 #endif
         if (!IsHostSharedMemoryDescriptor(value)) {
-#ifdef __linux__
+#ifdef _WIN32
+            FILE_ID_INFO currentIdentity{};
+            if (identified && (!DescriptorIdentity(value, currentIdentity) || !SameIdentity(originalIdentity, currentIdentity))) {
+                shared = true;
+                error = EBADF;
+            }
+#elif defined(__linux__)
             struct stat currentStatus{};
             if (::fstat(value, &currentStatus) != 0) { shared = true; error = errno; return; }
             if (currentStatus.st_dev != originalStatus.st_dev || currentStatus.st_ino != originalStatus.st_ino) {
@@ -249,7 +311,10 @@ public:
         if (descriptor < 0) { error = errno; return; }
         if (!IsHostSharedMemoryDescriptor(descriptor)) { error = EBADF; return; }
         if (!Refresh()) { error = errno; return; }
-#ifdef __linux__
+#ifdef _WIN32
+        FILE_ID_INFO pinnedIdentity{};
+        if (!identified || !DescriptorIdentity(descriptor, pinnedIdentity) || !SameIdentity(originalIdentity, pinnedIdentity)) error = EBADF;
+#elif defined(__linux__)
         if (status.st_dev != originalStatus.st_dev || status.st_ino != originalStatus.st_ino) error = EBADF;
 #endif
     }
@@ -269,14 +334,17 @@ public:
     bool IsShared() const { return shared; }
     int Error() const { return error; }
     int Descriptor() const { return descriptor; }
+    std::int64_t Size() const { return fileSize; }
     bool Refresh() {
 #ifdef _WIN32
         struct _stat64 nativeStatus{};
         if (::_fstat64(descriptor, &nativeStatus) != 0) return false;
-        status.st_size = nativeStatus.st_size;
+        fileSize = nativeStatus.st_size;
         return true;
 #else
-        return ::fstat(descriptor, &status) == 0;
+        if (::fstat(descriptor, &status) != 0) return false;
+        fileSize = status.st_size;
+        return true;
 #endif
     }
     struct stat status{};
@@ -284,7 +352,7 @@ public:
 private:
     static int Duplicate(int value) {
 #ifdef _WIN32
-        return ::_dup(value);
+        return WithoutDescriptorParameterHandler([value] { return ::_dup(value); });
 #else
         return ::fcntl(value, F_DUPFD_CLOEXEC, 0);
 #endif
@@ -294,6 +362,7 @@ private:
     std::optional<HostShmLock> hostLock;
     bool shared = false;
     int error = 0;
+    std::int64_t fileSize = 0;
 };
 }
 
@@ -308,15 +377,15 @@ std::int64_t WriteSharedMemory_nid_no_patch(int descriptor, const void* buffer, 
     if (access < 0) return -1;
     if ((access & O_ACCMODE) == O_RDONLY) { errno = EBADF; return -1; }
 #endif
-    const auto& status = guard.status;
+    const auto fileSize = guard.Size();
 #ifdef _WIN32
     const auto position = ::_lseeki64(fd, 0, SEEK_CUR);
 #else
     const auto position = ::lseek(fd, 0, SEEK_CUR);
 #endif
     if (position < 0) return -1;
-    if (position >= status.st_size) return 0;
-    const auto count = std::min<std::uint64_t>(size, static_cast<std::uint64_t>(status.st_size - position));
+    if (position >= fileSize) return 0;
+    const auto count = std::min<std::uint64_t>(size, static_cast<std::uint64_t>(fileSize - position));
 #ifdef _WIN32
     const auto result = ::_write(fd, buffer, static_cast<unsigned int>(std::min<std::uint64_t>(count, std::numeric_limits<unsigned int>::max())));
 #else
@@ -336,12 +405,12 @@ std::int64_t PwriteSharedMemory_nid_no_patch(int descriptor, const void* buffer,
     if (access < 0) return -1;
     if ((access & O_ACCMODE) == O_RDONLY) { errno = EBADF; return -1; }
 #endif
-    const auto& status = guard.status;
+    const auto fileSize = guard.Size();
     if (offset < 0) { errno = EINVAL; return -1; }
-    if (offset >= status.st_size) return 0;
-    const auto count = std::min<std::uint64_t>(size, static_cast<std::uint64_t>(status.st_size - offset));
+    if (offset >= fileSize) return 0;
+    const auto count = std::min<std::uint64_t>(size, static_cast<std::uint64_t>(fileSize - offset));
 #ifdef _WIN32
-    const auto result = NativePositioned_nid_no_patch(fd, const_cast<void*>(buffer), static_cast<std::size_t>(count), offset, true);
+    const auto result = NativePositionedRaw_nid_no_patch(fd, const_cast<void*>(buffer), static_cast<std::size_t>(count), offset, true);
 #else
     const auto result = ::pwrite(fd, buffer, static_cast<std::size_t>(count), static_cast<off_t>(offset));
 #endif
@@ -354,7 +423,7 @@ std::int64_t SeekSharedMemory_nid_no_patch(int descriptor, std::int64_t offset, 
     if (guard.Error() != 0) { errno = guard.Error(); return -1; }
     if (!guard.Refresh()) return -1;
     const auto fd = guard.Descriptor();
-    const auto& status = guard.status;
+    const auto fileSize = guard.Size();
     std::int64_t base = 0;
     if (whence == SEEK_CUR) {
 #ifdef _WIN32
@@ -364,7 +433,7 @@ std::int64_t SeekSharedMemory_nid_no_patch(int descriptor, std::int64_t offset, 
 #endif
         if (base < 0) return -1;
     } else if (whence == SEEK_END) {
-        base = static_cast<std::int64_t>(status.st_size);
+        base = fileSize;
     } else if (whence != SEEK_SET) {
         errno = EINVAL;
         return -1;
@@ -375,7 +444,7 @@ std::int64_t SeekSharedMemory_nid_no_patch(int descriptor, std::int64_t offset, 
         return -1;
     }
     const auto target = base + offset;
-    if (target < 0 || target > status.st_size) {
+    if (target < 0 || target > fileSize) {
         errno = EINVAL;
         return -1;
     }
@@ -441,7 +510,9 @@ int TruncateSharedMemory_nid_no_patch(int descriptor, std::int64_t length) {
     if (guard.Error() != 0) { errno = guard.Error(); return -1; }
     const auto fd = guard.Descriptor();
 #ifdef _WIN32
-    const int result = static_cast<int>(::_chsize_s(fd, length));
+    const int error = static_cast<int>(::_chsize_s(fd, length));
+    if (error != 0) { errno = error; return -1; }
+    const int result = 0;
 #else
     const int result = ::ftruncate(fd, static_cast<off_t>(length));
 #endif

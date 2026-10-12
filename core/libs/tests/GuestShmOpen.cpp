@@ -37,9 +37,7 @@ int main() {
     Require(pread_nid_postfix(first, &last, 1, 0x3fff) == 1 && last == 0);
     Require(pread_nid_postfix(first, &last, 1, 0x4000) == 0);
     Require(pread_nid_postfix(second, back, sizeof(back), 0) == 0);
-#ifndef _WIN32
     Require(pwrite_nid_disambig1_nid_postfix(third, text, sizeof(text), 0) == 0);
-#endif
     Require(ftruncate_nid_postfix(third, 0x4000) == 0);
     Require(pwrite_nid_disambig1_nid_postfix(third, text, sizeof(text), 0) == static_cast<std::int64_t>(sizeof(text)));
     Require(close_nid_postfix(first) == 0 && close_nid_postfix(second) == 0 && close_nid_postfix(third) == 0);
