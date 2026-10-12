@@ -74,6 +74,7 @@ int APS5_VABI __isfinitef_nid_postfix(float x) { return std::isfinite(x) ? 1 : 0
 int APS5_VABI __isnormal_nid_postfix(double x) { return std::isnormal(x) ? 1 : 0; }
 int APS5_VABI __isnormalf_nid_postfix(float x) { return std::isnormal(x) ? 1 : 0; }
 int APS5_VABI __isinff_nid_postfix(float x) { return std::isinf(x) ? 1 : 0; }
+float APS5_VABI nearbyintf_nid_postfix(float x) { return std::nearbyintf(x); }
 
 double APS5_VABI cbrt_nid_postfix(double x) { return std::cbrt(x); }
 double APS5_VABI asin_nid_postfix(double x) {
@@ -151,7 +152,12 @@ float APS5_VABI logf_nid_postfix(float x) { return std::log(x); }
 float APS5_VABI log2f_nid_postfix(float x) { return std::log2(x); }
 double APS5_VABI log10_nid_postfix(double x) { return std::log10(x); }
 float APS5_VABI ldexpf_nid_postfix(float x, int exp) { return std::ldexp(x, exp); }
-double APS5_VABI fmod_nid_postfix(double x, double y) { return std::fmod(x, y); }
+double APS5_VABI fmod_nid_postfix(double x, double y) {
+    int saved_errno = errno;
+    double result = std::fmod(x, y);
+    errno = saved_errno;
+    return result;
+}
 float APS5_VABI roundf_nid_postfix(float x) { return std::round(x); }
 double APS5_VABI round_nid_postfix(double x) { return std::round(x); }
 float APS5_VABI cbrtf_nid_postfix(float x) { return std::cbrt(x); }
@@ -209,6 +215,7 @@ short APS5_VABI _FDtest_nid_postfix(const float* value) {
     return Finite;
 }
 int APS5_VABI __isnanf_nid_postfix(float x) { return std::isnan(x) ? 1 : 0; }
+int APS5_VABI isnanf_nid_postfix(float x) { return __isnanf_nid_postfix(x); }
 int APS5_VABI __fpclassifyf_nid_postfix(float x) {
     constexpr int Infinite = 0x01, NotANumber = 0x02, Normal = 0x04, Subnormal = 0x08, Zero = 0x10;
     std::uint32_t bits;
@@ -220,6 +227,10 @@ int APS5_VABI __fpclassifyf_nid_postfix(float x) {
     return Normal;
 }
 int APS5_VABI __signbitf_nid_postfix(float x) { return std::signbit(x) ? 1 : 0; }
+int APS5_VABI __signbitl_nid_postfix(long double x) {
+    static_assert(sizeof(long double) == 16, "guest long double requires x87 extended precision storage");
+    return std::signbit(x) ? 1 : 0;
+}
 
 static std::mutex g_randLock;
 static std::uint32_t g_randState = 1;

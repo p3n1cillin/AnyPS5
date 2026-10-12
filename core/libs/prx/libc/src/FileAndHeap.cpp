@@ -11,6 +11,14 @@
 #include <utility>
 #include <cerrno>
 #include <cstring>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#endif
 
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
@@ -45,9 +53,29 @@ static std::optional<GuestFileMode> ParseFileMode(const char* mode) {
 
 static std::FILE* OpenNative(const std::filesystem::path& path, const std::string& nativeMode) {
 #ifdef _WIN32
-    std::wstring wideMode;
-    for (const char character : nativeMode) wideMode.push_back(static_cast<unsigned char>(character));
-    return ::_wfopen(path.c_str(), wideMode.c_str());
+    const char access = nativeMode[0];
+    const bool update = nativeMode.find('+') != std::string::npos;
+    const DWORD desired = update ? GENERIC_READ | GENERIC_WRITE : access == 'r' ? GENERIC_READ : GENERIC_WRITE;
+    const DWORD disposition = access == 'r' ? OPEN_EXISTING
+        : nativeMode.find('x') != std::string::npos ? CREATE_NEW : access == 'w' ? CREATE_ALWAYS : OPEN_ALWAYS;
+    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    const auto handle = CreateFileW(path.c_str(), desired, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security,
+        disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = WindowsOpenError_nid_no_patch(GetLastError());
+        return nullptr;
+    }
+    const int descriptor = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(handle), access == 'a' ? _O_APPEND : 0);
+    if (descriptor < 0) {
+        CloseHandle(handle);
+        return nullptr;
+    }
+    std::wstring streamMode;
+    for (const char character : nativeMode)
+        if (character != 'x') streamMode.push_back(static_cast<unsigned char>(character));
+    std::FILE* stream = ::_wfdopen(descriptor, streamMode.c_str());
+    if (!stream) ::_close(descriptor);
+    return stream;
 #else
     return std::fopen(path.c_str(), nativeMode.c_str());
 #endif
