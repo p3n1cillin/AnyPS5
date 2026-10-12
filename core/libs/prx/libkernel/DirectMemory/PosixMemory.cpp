@@ -11,12 +11,17 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#include <io.h>
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI sceKernelMlock_nid_postfix(void* address, std::uint64_t length);
 extern "C" int APS5_VABI sceKernelMunlock_nid_postfix(void* address, std::uint64_t length);
 extern "C" int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info, uint64_t info_size);
+#ifdef _WIN32
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+#endif
 
 namespace {
 // FreeBSD/PS5 ABI values, independent of the host's errno and mmap constants.
@@ -40,13 +45,19 @@ constexpr std::uintptr_t GuestUserAddressEnd = 0x800000000000;
 constexpr int GuestAlignedSuper = 0x1000000;
 constexpr std::size_t SuperpageSize = std::size_t{1} << 21;
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
 class ScopedDescriptor {
 public:
-    explicit ScopedDescriptor(int value) noexcept : descriptor(fcntl(value, F_DUPFD_CLOEXEC, 0)), error(descriptor < 0 ? errno : 0) {}
+    explicit ScopedDescriptor(int value) noexcept : descriptor(Duplicate(value)), error(descriptor < 0 ? errno : 0) {}
     ~ScopedDescriptor() {
         const int savedError = errno;
-        if (descriptor >= 0) close(descriptor);
+        if (descriptor >= 0) {
+#ifdef _WIN32
+            ::_close(descriptor);
+#else
+            ::close(descriptor);
+#endif
+        }
         errno = savedError;
     }
     ScopedDescriptor(const ScopedDescriptor&) = delete;
@@ -54,6 +65,19 @@ public:
     int Get() const noexcept { return descriptor; }
     int Error() const noexcept { return error; }
 private:
+    static int Duplicate(int value) noexcept {
+#ifdef _WIN32
+        const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+        const int result = ::_dup(value);
+        _set_thread_local_invalid_parameter_handler(previous);
+        return result;
+#else
+        return ::fcntl(value, F_DUPFD_CLOEXEC, 0);
+#endif
+    }
+#ifdef _WIN32
+    static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
+#endif
     int descriptor = -1;
     int error = 0;
 };
@@ -113,15 +137,17 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         rounded > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) ||
         static_cast<std::uint64_t>(offset) > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - rounded)
         return failed(GuestInvalid);
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     const ScopedDescriptor pinnedDescriptor(descriptor);
     if (pinnedDescriptor.Get() < 0) return failed(pinnedDescriptor.Error());
     const int mappingDescriptor = pinnedDescriptor.Get();
+#if defined(__linux__)
     const int descriptorFlags = fcntl(mappingDescriptor, F_GETFL);
     if (descriptorFlags < 0) return failed(errno);
     const int accessMode = descriptorFlags & O_ACCMODE;
     if ((protection & 1) != 0 && accessMode == O_WRONLY) return failed(GuestAccess);
     if (kind == GuestShared && (protection & 2) != 0 && accessMode == O_RDONLY) return failed(GuestAccess);
+#endif
     if (!File::IsSharedMemoryDescriptor_nid_no_patch(mappingDescriptor)) return failed(GuestNotSupported);
 #else
     const int mappingDescriptor = descriptor;
@@ -137,6 +163,10 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     } catch (const std::invalid_argument&) {
         return failed(GuestInvalid);
     } catch (const std::system_error& error) {
+        if (error.code() == std::errc::not_enough_memory) return failed(GuestNoMemory);
+        if (error.code() == std::errc::permission_denied || error.code() == std::errc::operation_not_permitted) return failed(GuestAccess);
+        if (error.code() == std::errc::bad_file_descriptor) return failed(GuestBadDescriptor);
+        if (error.code() == std::errc::invalid_argument) return failed(GuestInvalid);
         const int hostError = error.code().value();
         if (hostError == ENOTSUP || hostError == EOPNOTSUPP) return failed(GuestNotSupported);
         if (hostError == EACCES || hostError == EPERM) return failed(GuestAccess);
@@ -186,6 +216,7 @@ int APS5_VABI mprotect_nid_postfix(void* address, std::size_t length, int protec
     } catch (const std::bad_alloc&) {
         return failed(GuestNoMemory);
     } catch (const std::system_error& error) {
+        if (error.code() == std::errc::permission_denied || error.code() == std::errc::operation_not_permitted) return failed(GuestAccess);
         const int hostError = error.code().value();
         return failed(hostError == EACCES || hostError == EPERM ? GuestAccess : GuestInvalid);
     } catch (const std::exception&) {

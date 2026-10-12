@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <cerrno>
 #include <algorithm>
 #include <cstdio>
 #include <cstddef>
@@ -53,13 +54,15 @@ public:
             } else {
                 if (memory.State != MEM_COMMIT) throw std::runtime_error("guest memory is not committed");
                 const auto mapped = views.find(cursor & ~(pageBytes - 1));
+                DWORD effective = protection;
                 if (mapped != views.end()) {
-                    mapped->second.protection = protection;
+                    effective = viewProtection(mapped->second, protection);
+                    mapped->second.protection = effective;
                     mapped->second.armed = false;
                     invalidate(*mapped->second.page);
                 }
                 DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, effective, &previous)) fail("protect guest memory");
                 cursor = stop;
             }
         }
@@ -97,10 +100,50 @@ public:
         }
     }
 
+    void MapFile(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool copyOnWrite, bool writableSection, bool executableSection) {
+        std::lock_guard lock(mutex);
+        const auto cursor = reinterpret_cast<std::uintptr_t>(address);
+        auto owned = std::make_shared<Section>(nullptr);
+        if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &owned->handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep guest file section");
+        reset(cursor, bytes);
+        try {
+            for (std::size_t done = 0; done < bytes; done += pageBytes) {
+                auto shared = std::make_shared<SharedPage>();
+                const auto base = cursor + done;
+                View view{shared, protection, 0, false, owned, offset + done, 0, true, copyOnWrite, writableSection, executableSection};
+                const auto requested = viewProtection(view, protection);
+                DWORD initial = copyOnWrite ? PAGE_WRITECOPY : writableSection ? PAGE_READWRITE : PAGE_READONLY;
+                if (requested == PAGE_EXECUTE || requested == PAGE_EXECUTE_READ || requested == PAGE_EXECUTE_READWRITE || requested == PAGE_EXECUTE_WRITECOPY) {
+                    initial = copyOnWrite ? PAGE_EXECUTE_WRITECOPY : writableSection ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+                }
+                split(base, pageBytes);
+                void* page = reinterpret_cast<void*>(base);
+                if (!map(owned->handle, GetCurrentProcess(), page, offset + done, pageBytes, MEM_REPLACE_PLACEHOLDER, initial, nullptr, 0)) fail("map guest file page");
+                DWORD previous;
+                if (!VirtualProtect(page, pageBytes, requested, &previous)) fail("protect guest file page");
+                view.protection = requested;
+                shared->aliases.push_back(base);
+                views.emplace(base, std::move(view));
+            }
+        } catch (...) {
+            reset(cursor, bytes);
+            throw;
+        }
+    }
+
+    bool FileBacked(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
+            if (it->second.fileBacked) return true;
+        }
+        return false;
+    }
+
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
+        for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) viewProtection(it->second, protection);
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
-            it->second.protection = protection;
+            it->second.protection = viewProtection(it->second, protection);
             it->second.armed = false;
             invalidate(*it->second.page);
         }
@@ -182,12 +225,14 @@ public:
         if (address % pageBytes != 0 || bytes % pageBytes != 0 || bytes == 0) throw refuse("the range is not made of whole shared pages");
         auto view = views.find(address);
         if (view == views.end()) throw refuse("the range does not start at a shared view");
+        if (view->second.fileBacked) throw refuse("file mappings require CPU copies");
         const auto section = view->second.section;
         const auto offset = view->second.offset;
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         for (std::size_t done = 0; done < bytes; done += pageBytes, ++view) {
             if (view == views.end() || view->first != address + done || view->second.offset != offset + done) throw refuse("the range is not one contiguous run of views of a section");
+            if (view->second.fileBacked) throw refuse("file mappings require CPU copies");
             if (view->second.section != section && !sameSection(view->second.section->handle, section->handle)) throw refuse("the range spans several sections");
         }
         const auto lead = offset % system.dwAllocationGranularity;
@@ -221,6 +266,9 @@ public:
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            if (it->second.fileBacked) return false;
+        }
         if (clear && !collectable(address, end)) return false;
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
@@ -312,7 +360,22 @@ private:
         std::shared_ptr<Section> section;
         std::uint64_t offset;
         std::uint32_t hostWrites;
+        bool fileBacked = false;
+        bool copyOnWrite = false;
+        bool writableSection = true;
+        bool executableSection = true;
     };
+    static DWORD viewProtection(const View& view, DWORD requested) {
+        if (!view.fileBacked) return requested;
+        if (writable(requested) && !view.copyOnWrite && !view.writableSection) throw std::system_error(EACCES, std::generic_category(), "guest file mapping is read-only");
+        const bool executable = requested == PAGE_EXECUTE || requested == PAGE_EXECUTE_READ || requested == PAGE_EXECUTE_READWRITE || requested == PAGE_EXECUTE_WRITECOPY;
+        if (executable && !view.executableSection) throw std::system_error(EACCES, std::generic_category(), "guest file mapping is not executable");
+        if (view.copyOnWrite) {
+            if (requested == PAGE_READWRITE) return PAGE_WRITECOPY;
+            if (requested == PAGE_EXECUTE_READWRITE) return PAGE_EXECUTE_WRITECOPY;
+        }
+        return requested;
+    }
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
         auto it = cleanRanges.lower_bound(start);
         if (it != cleanRanges.begin() && std::prev(it)->second > start) --it;
@@ -346,7 +409,7 @@ private:
     }
 
     static bool writable(DWORD protection) {
-        return protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE;
+        return protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY;
     }
     using AllocateFunction = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
     using MapFunction = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);

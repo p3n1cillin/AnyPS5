@@ -654,6 +654,10 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     entry.range = run.ranges.front();
     entry.ranges = std::move(run.ranges);
 #ifdef _WIN32
+    if (GuestArena::GuestArenaFileBacked_nid_no_patch(base, bytes)) {
+        state.failed.insert(base);
+        return nullptr;
+    }
     // Drivers pin imported pages, so every page must be committed and accessible.
     bool writable = true;
     bool readOnly = true;

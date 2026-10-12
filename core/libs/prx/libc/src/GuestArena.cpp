@@ -373,6 +373,15 @@ void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) 
     return WindowsMappings::Get().MapAlias(address, bytes);
 }
 
+void GuestArenaMapFile_nid_no_patch(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, bool copyOnWrite, bool writable, bool executable) {
+    if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("file mapping", pointer, bytes);
+    WindowsMappings::Get().MapFile(pointer, bytes, section, offset, protection, copyOnWrite, writable, executable);
+}
+
+bool GuestArenaFileBacked_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().FileBacked(address, bytes);
+}
+
 void GuestArenaUnmapAlias_nid_postfix(void* alias) {
     WindowsMappings::Get().UnmapAlias(alias);
 }
