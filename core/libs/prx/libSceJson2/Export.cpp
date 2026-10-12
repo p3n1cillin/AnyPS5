@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <list>
 #include <mutex>
 #include <stdexcept>
@@ -906,9 +907,22 @@ int APS5_VABI _ZN3sce4Json6Object4PairD1Ev() {
     return 0;
 }
 
-int APS5_VABI _ZN3sce4Json6Object6insertERKNS1_4PairE() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+ObjectIterator* APS5_VABI _ZN3sce4Json6Object6insertERKNS1_4PairE(ObjectIterator* result, Object* self, const Pair* pair) {
+    if (pair == nullptr) throw std::invalid_argument("sce::Json::Object::insert: null pair");
+    for (const auto& existing : *self->items)
+        if (*existing.key.text == *pair->key.text) throw std::runtime_error("sce::Json::Object::insert: duplicate key; the console's behaviour is unknown");
+    Pair copy{};
+    Construct(copy.key, *pair->key.text);
+    try {
+        CopyInto(copy.value, pair->value);
+    } catch (...) {
+        Destroy(copy.key);
+        Destroy(copy.value);
+        throw;
+    }
+    self->items->push_back(copy);
+    result->it = std::prev(self->items->end());
+    return result;
 }
 
 int APS5_VABI _ZN3sce4Json5Array8iteratorppEi() {
