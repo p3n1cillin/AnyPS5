@@ -61,6 +61,7 @@ Pair* APS5_VABI _ZNK3sce4Json6Object8iteratorptEv(const Iterator*);
 Iterator* APS5_VABI _ZNK3sce4Json6Object4findERKNS0_6StringE(Iterator*, const Object*, const String*);
 int APS5_VABI _ZNK3sce4Json6String7compareEPKc(const String*, const char*);
 bool APS5_VABI _ZNK3sce4Json6Object8iteratorneERKS2_(const Iterator*, const Iterator*);
+Iterator* APS5_VABI _ZN3sce4Json6Object6insertERKNS1_4PairE(Iterator*, Object*, const Pair*);
 void APS5_VABI _ZN3sce4Json5ValueC1Ev(Value*);
 void APS5_VABI _ZN3sce4Json5ValueC1Eb(Value*, bool);
 void APS5_VABI _ZN3sce4Json5ValueC1Ed(Value*, double);
@@ -596,6 +597,44 @@ static int APS5_VABI ReadNext(char& ch, void* context) {
     return 0;
 }
 
+static void ObjectInsert() {
+    Object object{};
+    _ZN3sce4Json6ObjectC1Ev(&object);
+    Pair first{};
+    _ZN3sce4Json6StringC1EPKc(&first.key, "k");
+    _ZN3sce4Json5ValueC1Ev(&first.value);
+    Require(_ZN3sce4Json5Value3setEl(&first.value, 7) == 0);
+    Iterator inserted{};
+    Require(_ZN3sce4Json6Object6insertERKNS1_4PairE(&inserted, &object, &first) == &inserted);
+    const Pair* stored = _ZNK3sce4Json6Object8iteratordeEv(&inserted);
+    Require(stored != &first && stored->value.node != first.value.node);
+    Require(std::strcmp(_ZNK3sce4Json6String5c_strEv(&stored->key), "k") == 0);
+    Require(_ZN3sce4Json5Value3setEl(&first.value, 8) == 0);
+    Require(*_ZNK3sce4Json5Value10getIntegerEv(&stored->value) == 7);
+    Pair second{};
+    _ZN3sce4Json6StringC1EPKc(&second.key, "j");
+    _ZN3sce4Json5ValueC1Ev(&second.value);
+    Require(_ZN3sce4Json5Value3setEPKc(&second.value, "s") == 0);
+    Iterator next{};
+    _ZN3sce4Json6Object6insertERKNS1_4PairE(&next, &object, &second);
+    Require(std::strcmp(_ZNK3sce4Json6String5c_strEv(&_ZNK3sce4Json6Object8iteratordeEv(&next)->key), "j") == 0);
+    Require(_ZNK3sce4Json6Object4sizeEv(&object) == 2);
+    bool threw = false;
+    try { _ZN3sce4Json6Object6insertERKNS1_4PairE(&next, &object, &first); } catch (const std::runtime_error&) { threw = true; }
+    Require(threw && _ZNK3sce4Json6Object4sizeEv(&object) == 2);
+    Value wrapped{};
+    _ZN3sce4Json5ValueC1ERKNS0_6ObjectE(&wrapped, &object);
+    Require(Serialize(wrapped) == "{\"k\":7,\"j\":\"s\"}");
+    _ZN3sce4Json5ValueD1Ev(&wrapped);
+    _ZN3sce4Json6Object8iteratorD1Ev(&inserted);
+    _ZN3sce4Json6Object8iteratorD1Ev(&next);
+    _ZN3sce4Json6StringD1Ev(&first.key);
+    _ZN3sce4Json5ValueD1Ev(&first.value);
+    _ZN3sce4Json6StringD1Ev(&second.key);
+    _ZN3sce4Json5ValueD1Ev(&second.value);
+    _ZN3sce4Json6ObjectD1Ev(&object);
+}
+
 static void StreamParse() {
     Value root{};
     _ZN3sce4Json5ValueC1Ev(&root);
@@ -615,6 +654,7 @@ int main() {
     NestingDepth();
     ObjectsAndArrays();
     ObjectFind();
+    ObjectInsert();
     NullAccess(_ZN3sce4Json11Initializer27setGlobalNullAccessCallBackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_);
     NullAccess(_ZN3sce4Json11Initializer27setGlobalNullAccessCallbackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_);
     ValueAccess();
