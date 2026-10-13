@@ -120,12 +120,19 @@ HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
         }
         launch.executable = target.wstring();
     }
+    for (std::size_t index = 0; arguments != nullptr && arguments[index] != nullptr; ++index) {
+        const auto argument = Utf16(arguments[index]);
+        if (index > 0) {
+            launch.commandLine += L" " + QuotedArgument(argument);
+        } else if (argument.find(L'"') == std::wstring::npos) {
+            launch.commandLine = L"\"" + argument + L"\"";
+        } else {
+            UnconvertedExecutable("a first argument containing a double quote");
+        }
+    }
+    if (launch.commandLine.empty()) launch.commandLine = L"\"" + launch.executable + L"\"";
     if (GetEnvironmentVariableW(MainExecutableVariableWide, nullptr, 0) == 0 && !SetEnvironmentVariableW(MainExecutableVariableWide, own.c_str())) {
         throw std::runtime_error(std::string("sceSystemServiceLoadExec: cannot set ") + MainExecutableVariable);
-    }
-    launch.commandLine = L"\"" + launch.executable + L"\"";
-    for (std::size_t index = 0; arguments != nullptr && arguments[index] != nullptr; ++index) {
-        launch.commandLine += L" " + QuotedArgument(Utf16(arguments[index]));
     }
     return launch;
 }
@@ -164,7 +171,6 @@ HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
     if (setenv(MainExecutableVariable, own.c_str(), 0) != 0) {
         throw std::runtime_error(std::string("sceSystemServiceLoadExec: cannot set ") + MainExecutableVariable);
     }
-    launch.arguments.push_back(launch.executable);
     for (std::size_t index = 0; arguments != nullptr && arguments[index] != nullptr; ++index) launch.arguments.emplace_back(arguments[index]);
     return launch;
 }

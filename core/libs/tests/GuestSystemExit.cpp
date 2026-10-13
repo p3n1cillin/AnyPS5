@@ -146,17 +146,17 @@ int main(int argc, char** argv) {
         sceSystemServiceLoadExec("/app0/picker/picker.bin", arguments);
         return 2;
     }
-    if (argc > 1 && std::strcmp(argv[1], "--secondary") == 0) {
+    if (argc > 0 && std::strcmp(argv[0], "--secondary") == 0) {
         Require(OwnExecutable().filename().string().starts_with("picker.picker.bin"));
         std::string received = "arguments:";
-        for (int index = 1; index < argc; ++index) received += std::string(index == 1 ? " " : "|") + argv[index];
+        for (int index = 0; index < argc; ++index) received += std::string(index == 0 ? " " : "|") + argv[index];
         AppendMarker(received);
         LibcRegisterShutdown_nid_postfix(SecondaryShutdown);
         const char* const arguments[] = {"--relaunched", nullptr};
         sceSystemServiceLoadExec("/app0/eboot.bin", arguments);
         return 2;
     }
-    if (argc > 1 && std::strcmp(argv[1], "--relaunched") == 0) {
+    if (argc == 1 && std::strcmp(argv[0], "--relaunched") == 0) {
         const char* main = std::getenv(MainExecutable);
         Require(main != nullptr && std::filesystem::equivalent(OwnExecutable(), main));
         AppendMarker("relaunched");
