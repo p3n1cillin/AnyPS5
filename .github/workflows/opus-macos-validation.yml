@@ -1,0 +1,94 @@
+name: Validate Opus macOS visibility
+
+on:
+  push:
+    branches: [codex/opus-macos-validation-20261021]
+
+permissions:
+  contents: read
+
+jobs:
+  opus-macos:
+    if: github.repository == 'p3n1cillin/AnyPS5'
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+      - name: Fetch pinned Opus source
+        run: git submodule update --init --depth 1 3rdparty/opus
+      - name: Build actual Opus PRX sources and compare exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          clang++ --version
+          mkdir -p "$RUNNER_TEMP/opus-project" "$RUNNER_TEMP/opus-results"
+          ln -s "$GITHUB_WORKSPACE/3rdparty" "$RUNNER_TEMP/opus-project/3rdparty"
+          git show 66de92a2ab608d1b18e9af5d62a16ce6ca84b4d9:cmake/Opus.cmake > "$RUNNER_TEMP/opus-baseline.cmake"
+          cat > "$RUNNER_TEMP/opus-project/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.20)
+          project(OpusVisibility LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          include(CTest)
+          include("${OPUS_HELPER}")
+          foreach(library IN ITEMS libSceOpusDec libSceOpusCeltDec)
+              string(REPLACE "libSce" "Guest" test_file "${library}")
+              add_library(${library} SHARED "${REPO}/core/libs/prx/${library}/Export.cpp" shim.cpp)
+              set_target_properties(${library} PROPERTIES PREFIX "" SUFFIX ".prx")
+              target_include_directories(${library} PRIVATE "${REPO}/core/libs")
+              target_link_libraries(${library} PRIVATE opus)
+              add_executable(${library}_test "${REPO}/core/libs/tests/${test_file}.cpp")
+              target_include_directories(${library}_test PRIVATE "${REPO}/core/libs")
+              target_link_libraries(${library}_test PRIVATE ${library} opus)
+              add_test(NAME ${library} COMMAND ${library}_test)
+          endforeach()
+          CMAKE
+          cat > "$RUNNER_TEMP/opus-project/shim.cpp" <<'CPP'
+          #include <stdexcept>
+          extern "C" [[noreturn]] void NotImplemented_nid_no_patch(const char* name) {
+              throw std::runtime_error(name);
+          }
+          CPP
+          for variant in baseline fixed; do
+            helper="$GITHUB_WORKSPACE/cmake/Opus.cmake"
+            if [ "$variant" = baseline ]; then helper="$RUNNER_TEMP/opus-baseline.cmake"; fi
+            cmake -S "$RUNNER_TEMP/opus-project" -B "$RUNNER_TEMP/opus-$variant" \
+              -DCMAKE_BUILD_TYPE=Release -DREPO="$GITHUB_WORKSPACE" -DOPUS_HELPER="$helper"
+            cmake --build "$RUNNER_TEMP/opus-$variant" --parallel 3
+            ctest --test-dir "$RUNNER_TEMP/opus-$variant" --output-on-failure
+            cp "$RUNNER_TEMP/opus-$variant/Testing/Temporary/LastTest.log" "$RUNNER_TEMP/opus-results/$variant-tests.log"
+          done
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          temporary = pathlib.Path(os.environ["RUNNER_TEMP"])
+          results = temporary / "opus-results"
+          def symbols(path):
+              output = subprocess.check_output(["nm", "-gU", str(path)], text=True)
+              (results / (path.parent.name + "-" + path.name + ".symbols.txt")).write_text(output)
+              return {m.group(1) for m in re.finditer(r"^[0-9a-fA-F]+\s+[A-Za-z]\s+(\S+)$", output, re.M)}
+          summary = {}
+          for variant in ["baseline", "fixed"]:
+              build = temporary / ("opus-" + variant)
+              codec = symbols(build / "3rdparty/opus/libopus.a")
+              for name in ["libSceOpusDec", "libSceOpusCeltDec"]:
+                  exports = symbols(build / (name + ".prx"))
+                  public = "_sce" + name.removeprefix("libSce") + "Decode"
+                  assert public in exports, (variant, name, "missing guest API")
+                  leaked = sorted(codec & exports)
+                  summary[variant + "-" + name] = {"codec_exports": len(leaked), "sample": leaked[:20]}
+                  if variant == "baseline":
+                      assert leaked, (name, "baseline did not reproduce leak")
+                  else:
+                      assert not leaked, (name, leaked)
+          print(json.dumps(summary, indent=2))
+          (results / "summary.json").write_text(json.dumps(summary, indent=2))
+          PY
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: opus-macos-visibility
+          path: ${{ runner.temp }}/opus-results
+          if-no-files-found: warn
