@@ -36,8 +36,8 @@ int APS5_VABI sceHttpUriMerge(char*, const char*, const char*, std::size_t*, std
 int APS5_VABI sceNetSocket(const char*, int, int, int);
 int APS5_VABI sceNetSocketClose(int);
 int APS5_VABI sceNetConnect(int, const void*, std::uint32_t);
-std::int64_t APS5_VABI sceNetSend(int, const void*, std::size_t, int);
-std::int64_t APS5_VABI sceNetRecv(int, void*, std::size_t, int);
+std::int64_t NetSend_nid_no_patch(int, const void*, std::size_t, int);
+std::int64_t NetRecv_nid_no_patch(int, void*, std::size_t, int);
 int APS5_VABI sceNetSetsockopt(int, int, int, const void*, std::uint32_t);
 int APS5_VABI sceNetGetsockopt(int, int, int, void*, std::uint32_t*);
 int APS5_VABI sceNetEpollCreate(const char*, int);
@@ -47,7 +47,7 @@ int APS5_VABI sceNetEpollDestroy(int);
 int APS5_VABI sceSslCreateConnection(int, int, const char*);
 int APS5_VABI sceSslDeleteConnection(int);
 int APS5_VABI sceSslConnect(int);
-int APS5_VABI sceSslRead(int, void*, std::size_t, int);
+int SslRead_nid_no_patch(int, void*, std::size_t, int);
 int APS5_VABI sceSslWrite(int, void*, std::size_t, int);
 int APS5_VABI sceSslSetVerifyCallback(int, int (APS5_VABI *)(int, unsigned int, void**, int, void*), void*);
 int APS5_VABI sceHttpParseStatusLine(const char*, std::size_t, std::int32_t*, std::int32_t*, std::int32_t*, const char**, std::size_t*);
@@ -126,8 +126,8 @@ public:
     int Read(void* buffer, std::size_t size) {
         if (closed_) return 0;
         const auto limit = std::min<std::size_t>(size, static_cast<std::size_t>(std::numeric_limits<int>::max()));
-        if (secure_) return sceSslRead(ssl_, buffer, limit, 0);
-        const auto result = sceNetRecv(socket_, buffer, limit, 0);
+        if (secure_) return SslRead_nid_no_patch(ssl_, buffer, limit, 0);
+        const auto result = NetRecv_nid_no_patch(socket_, buffer, limit, 0);
         return result < 0 ? ERROR_NETWORK : static_cast<int>(result);
     }
 
@@ -137,7 +137,7 @@ public:
         while (sent < size) {
             const auto count = std::min<std::size_t>(size - sent, static_cast<std::size_t>(std::numeric_limits<int>::max()));
             const int result = secure_ ? sceSslWrite(ssl_, const_cast<unsigned char*>(bytes + sent), count, 0)
-                                       : static_cast<int>(sceNetSend(socket_, bytes + sent, count, 0));
+                                       : static_cast<int>(NetSend_nid_no_patch(socket_, bytes + sent, count, 0));
             if (result <= 0) return ERROR_NETWORK;
             sent += static_cast<std::size_t>(result);
         }
