@@ -48,6 +48,7 @@ int APS5_VABI sceSslCreateConnection(int, int, const char*);
 int APS5_VABI sceSslDeleteConnection(int);
 int APS5_VABI sceSslConnect(int);
 int SslRead_nid_no_patch(int, void*, std::size_t, int);
+int SslTrustSystemRoots_nid_no_patch(int);
 int APS5_VABI sceSslWrite(int, void*, std::size_t, int);
 int APS5_VABI sceSslSetVerifyCallback(int, int (APS5_VABI *)(int, unsigned int, void**, int, void*), void*);
 int APS5_VABI sceHttpParseStatusLine(const char*, std::size_t, std::int32_t*, std::int32_t*, std::int32_t*, const char**, std::size_t*);
@@ -554,6 +555,12 @@ int CreateSocketStream(const std::shared_ptr<RequestData>& request, const Url& u
         ssl = sceSslCreateConnection(context->sslContextId, socket, url.host.c_str());
         if (ssl < 0) {
             request->lastError = ssl;
+            sceNetSocketClose(socket);
+            return ERROR_NETWORK;
+        }
+        if (const int result = SslTrustSystemRoots_nid_no_patch(ssl); result != 0) {
+            request->lastError = result;
+            sceSslDeleteConnection(ssl);
             sceNetSocketClose(socket);
             return ERROR_NETWORK;
         }
