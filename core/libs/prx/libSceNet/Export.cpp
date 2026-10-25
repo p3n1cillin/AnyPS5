@@ -1223,6 +1223,14 @@ int64_t APS5_VABI sceNetSend(int s, const void* buf, size_t len, int flags) {
     return result >= 0 ? result : fail(native_error());
 }
 
+int64_t NetRecv_nid_no_patch(int s, void* buf, size_t len, int flags) {
+    return sceNetRecv(s, buf, len, flags);
+}
+
+int64_t NetSend_nid_no_patch(int s, const void* buf, size_t len, int flags) {
+    return sceNetSend(s, buf, len, flags);
+}
+
 int64_t APS5_VABI GuestNetSend_nid_no_patch(int s, const void* buf, size_t len, int flags) {
     return sceNetSend(s, buf, len, flags);
 }
