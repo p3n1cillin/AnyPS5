@@ -287,10 +287,10 @@ int APS5_VABI sceHttpGetStatusCode(int request_id, int* status_code) {
 int APS5_VABI sceHttpInit_nid_postfix(int memid, int ssl_ctx_id, uint64_t pool_size) {
     const int id = g_nextHandle.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(g_stateMutex);
-    g_contextPoolSizes[id] = pool_size;
-    g_contextRegisteredIds[id] = {memid, ssl_ctx_id};
-    g_contexts.insert(id);
     try {
+        g_contextPoolSizes.emplace(id, pool_size);
+        g_contextRegisteredIds.emplace(id, std::make_pair(memid, ssl_ctx_id));
+        g_contexts.insert(id);
         AddHttpContext(id);
         AddHttpTransportContext(id, memid, ssl_ctx_id);
     } catch (...) {
